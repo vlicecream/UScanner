@@ -1,0 +1,5 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "kind": "GetConfigData",
+  "engine_root": null
+}

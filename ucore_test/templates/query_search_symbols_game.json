@@ -1,0 +1,6 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "kind": "SearchSymbols",
+  "pattern": "Game",
+  "limit": 50
+}

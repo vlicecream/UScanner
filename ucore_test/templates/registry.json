@@ -1,0 +1,7 @@
+{
+  "${SIMPLEBETA_ROOT}": {
+    "db_path": "${UCORE_TEST_DIR}/simplebeta.db",
+    "cache_db_path": "${UCORE_TEST_DIR}/simplebeta-cache.db",
+    "vcs_hash": null
+  }
+}

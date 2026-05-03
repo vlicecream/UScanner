@@ -1,0 +1,4 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "db_path": "${UCORE_TEST_DIR}/simplebeta.db"
+}

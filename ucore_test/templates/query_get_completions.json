@@ -1,0 +1,8 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "kind": "GetCompletions",
+  "content": "UCLASS()\\nclass ASmokeTestActor : public AActor\\n{\\n    GENERATED_BODY()\\npublic:\\n    void Test()\\n    {\\n        this->\\n    }\\n};\\n",
+  "line": 7,
+  "character": 14,
+  "file_path": "${SIMPLEBETA_ROOT}/Source/SmokeTestActor.h"
+}

@@ -1,0 +1,35 @@
+{
+  "type": "refresh",
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "engine_root": null,
+  "db_path": "${UCORE_TEST_DIR}/simplebeta.db",
+  "cache_db_path": "${UCORE_TEST_DIR}/simplebeta-cache.db",
+  "config": {
+    "excludes_directory": [
+      "Binaries",
+      "Intermediate",
+      "Saved",
+      "Build",
+      "DerivedDataCache",
+      ".git",
+      ".vs"
+    ],
+    "include_extensions": [
+      "h",
+      "hh",
+      "hpp",
+      "cpp",
+      "cc",
+      "cxx",
+      "inl",
+      "cs",
+      "ini",
+      "uasset",
+      "umap",
+      "uproject",
+      "uplugin"
+    ]
+  },
+  "scope": "Game",
+  "vcs_hash": null
+}

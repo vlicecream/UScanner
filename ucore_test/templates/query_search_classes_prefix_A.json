@@ -1,0 +1,6 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "kind": "SearchClassesPrefix",
+  "prefix": "A",
+  "limit": 50
+}

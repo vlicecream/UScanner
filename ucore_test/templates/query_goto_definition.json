@@ -1,0 +1,8 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "kind": "GotoDefinition",
+  "content": "UCLASS()\\nclass ASmokeTestActor : public AActor\\n{\\n    GENERATED_BODY()\\n};\\n",
+  "line": 1,
+  "character": 24,
+  "file_path": "${SIMPLEBETA_ROOT}/Source/SmokeTestActor.h"
+}

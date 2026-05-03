@@ -1,0 +1,5 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "kind": "SearchFilesByPathPart",
+  "part": "Source"
+}

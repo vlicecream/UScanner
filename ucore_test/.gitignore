@@ -1,0 +1,6 @@
+local/
+out/
+*.db
+*.db-shm
+*.db-wal
+*.log

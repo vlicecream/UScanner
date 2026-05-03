@@ -1,0 +1,8 @@
+{
+  "project_root": "${SIMPLEBETA_ROOT}",
+  "kind": "ParseBuffer",
+  "content": "UCLASS()\\nclass ASmokeTestActor : public AActor\\n{\\n    GENERATED_BODY()\\npublic:\\n    UPROPERTY(EditAnywhere)\\n    int32 Health;\\n};\\n",
+  "file_path": "${SIMPLEBETA_ROOT}/Source/SmokeTestActor.h",
+  "line": 5,
+  "character": 10
+}
