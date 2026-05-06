@@ -299,7 +299,7 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     let sql = format!(
         r#"
         {}
-        WITH matched AS (
+        , matched AS (
             SELECT
                 sfts.rowid_ref,
                 sfts.name,
