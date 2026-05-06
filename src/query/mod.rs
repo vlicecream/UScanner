@@ -51,8 +51,12 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
         // 符号搜索查询
         // ---------------------------------------------------------------------
 
-        QueryRequest::SearchSymbols { pattern, limit } => {
-            search::search_symbols(conn, &pattern, limit)
+        QueryRequest::SearchSymbols {
+            pattern,
+            limit,
+            offset,
+        } => {
+            search::search_symbols(conn, &pattern, limit, offset)
         }
 
         QueryRequest::GetStructsOnly => search::get_structs(conn),

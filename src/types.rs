@@ -536,7 +536,12 @@ pub enum QueryRequest {
 
     // Symbol search and usage.
     // 符号搜索和引用查询。
-    SearchSymbols { pattern: String, limit: usize },
+    SearchSymbols {
+        pattern: String,
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+    },
     FindSymbolUsages {
         symbol_name: String,
         #[serde(default)]

@@ -1,19 +1,51 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
 
 use crate::db::project_path::PATH_CTE;
 
-/// Search indexed symbols by name using SQLite FTS.
-/// 使用 SQLite FTS 根据符号名搜索已索引的 symbol。
-pub fn search_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::Result<Value> {
+/// Search indexed symbols with database-side ranking and pagination.
+/// 使用数据库侧排序和分页搜索已索引的 symbol。
+///
+/// Ranking intentionally favors human "global find" expectations:
+/// - exact name matches first;
+/// - then name prefix matches;
+/// - then continuous substring matches in the symbol name;
+/// - then owner class / module / path matches;
+/// - only after those should picker-side fuzzy matching matter.
+///
+/// This prevents a query such as `death` from being dominated by loose
+/// `d ... e ... a ... t ... h` fuzzy results before real `Death*` symbols.
+/// 这里的优先级是给全局搜索用的：完全匹配、前缀匹配、连续子串匹配优先，
+/// 最后才让前端 fuzzy 参与，避免 `death` 被松散的字符级匹配结果压到后面。
+pub fn search_symbols(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Value> {
     let pattern = pattern.trim();
 
     if pattern.is_empty() {
-        return list_symbols(conn, limit);
+        return list_symbols(conn, limit, offset);
     }
 
     let limit = limit.clamp(1, 10_000) as i64;
-    let query = build_fts_query(pattern);
+    let offset = offset.min(1_000_000) as i64;
+    let query = pattern.to_ascii_lowercase();
+    let prefix_query = format!("{}%", escape_like(&query));
+    let contains_query = format!("%{}%", escape_like(&query));
+    let tokens = search_tokens(pattern);
+    let searchable = searchable_sql();
+    let token_filter = tokens
+        .iter()
+        .map(|_| format!("{searchable} LIKE ? ESCAPE '\\'"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let where_clause = if token_filter.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        token_filter
+    };
 
     let sql = format!(
         r#"
@@ -23,73 +55,61 @@ pub fn search_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow:
             sfts.type,
             sfts.class_name,
             dp.full_path || '/' || sn.text AS path,
-            c.line_number,
+            COALESCE(c.line_number, mem.line_number),
             sm.text AS module_name
         FROM symbols_fts sfts
-        JOIN classes c ON sfts.rowid_ref = c.id
-        JOIN files f ON c.file_id = f.id
+        LEFT JOIN classes c
+            ON c.id = sfts.rowid_ref
+           AND {}
+        LEFT JOIN members mem
+            ON mem.id = sfts.rowid_ref
+           AND NOT ({})
+        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
         JOIN dir_paths dp ON f.directory_id = dp.id
         JOIN strings sn ON f.filename_id = sn.id
         LEFT JOIN modules m ON f.module_id = m.id
         LEFT JOIN strings sm ON m.name_id = sm.id
-        WHERE symbols_fts MATCH ?
-        ORDER BY rank
-        LIMIT ?
+        WHERE {}
+        ORDER BY
+            CASE
+                WHEN lower(sfts.name) = ? THEN 0
+                WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 1
+                WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 2
+                WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\' THEN 3
+                WHEN lower(COALESCE(sm.text, '')) LIKE ? ESCAPE '\' THEN 4
+                WHEN lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\' THEN 5
+                ELSE 9
+            END,
+            CASE
+                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM') THEN 0
+                WHEN lower(COALESCE(sfts.type, '')) LIKE '%function%' OR lower(COALESCE(sfts.type, '')) LIKE '%method%' THEN 1
+                ELSE 2
+            END,
+            lower(sfts.name) ASC,
+            path ASC
+        LIMIT ? OFFSET ?
         "#,
-        PATH_CTE
+        PATH_CTE,
+        class_symbol_predicate("sfts"),
+        class_symbol_predicate("sfts"),
+        where_clause
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![query, limit], |row| {
-        Ok(json!({
-            "name": row.get::<_, String>(0)?,
-            "type": row.get::<_, String>(1)?,
-            "class_name": row.get::<_, String>(2)?,
-            "path": normalize_path(&row.get::<_, String>(3)?),
-            "line": row.get::<_, Option<i64>>(4)?,
-            "module_name": row.get::<_, Option<String>>(5)?,
-        }))
-    })?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
+    let mut params = Vec::new();
+    for token in &tokens {
+        params.push(SqlValue::Text(format!("%{}%", escape_like(token))));
     }
+    params.push(SqlValue::Text(query));
+    params.push(SqlValue::Text(prefix_query));
+    params.push(SqlValue::Text(contains_query.clone()));
+    params.push(SqlValue::Text(contains_query.clone()));
+    params.push(SqlValue::Text(contains_query.clone()));
+    params.push(SqlValue::Text(contains_query));
+    params.push(SqlValue::Integer(limit));
+    params.push(SqlValue::Integer(offset));
 
-    Ok(json!(results))
-}
-
-/// Return indexed symbols for interactive picker-side fuzzy filtering.
-/// 返回索引符号，供前端 picker 做本地模糊过滤。
-fn list_symbols(conn: &Connection, limit: usize) -> anyhow::Result<Value> {
-    let limit = limit.clamp(1, 10_000) as i64;
-
-    let sql = format!(
-        r#"
-        {}
-        SELECT
-            sc.text AS name,
-            c.symbol_type,
-            NULL AS class_name,
-            dp.full_path || '/' || sn.text AS path,
-            c.line_number,
-            sm.text AS module_name
-        FROM classes c
-        JOIN strings sc ON c.name_id = sc.id
-        JOIN files f ON c.file_id = f.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
-        WHERE sc.text NOT LIKE '(%'
-        ORDER BY sc.text ASC
-        LIMIT ?
-        "#,
-        PATH_CTE
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([limit], |row| {
+    let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok(json!({
             "name": row.get::<_, String>(0)?,
             "type": row.get::<_, String>(1)?,
@@ -106,6 +126,94 @@ fn list_symbols(conn: &Connection, limit: usize) -> anyhow::Result<Value> {
     }
 
     Ok(json!(results))
+}
+
+/// Return indexed symbols for interactive picker-side fuzzy filtering.
+/// 返回索引符号，供前端 picker 做本地模糊过滤。
+fn list_symbols(conn: &Connection, limit: usize, offset: usize) -> anyhow::Result<Value> {
+    let limit = limit.clamp(1, 10_000) as i64;
+    let offset = offset.min(1_000_000) as i64;
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sfts.name,
+            sfts.type,
+            sfts.class_name,
+            dp.full_path || '/' || sn.text AS path,
+            COALESCE(c.line_number, mem.line_number),
+            sm.text AS module_name
+        FROM symbols_fts sfts
+        LEFT JOIN classes c
+            ON c.id = sfts.rowid_ref
+           AND {}
+        LEFT JOIN members mem
+            ON mem.id = sfts.rowid_ref
+           AND NOT ({})
+        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE sfts.name NOT LIKE '(%'
+        ORDER BY lower(sfts.name) ASC
+        LIMIT ? OFFSET ?
+        "#,
+        PATH_CTE,
+        class_symbol_predicate("sfts"),
+        class_symbol_predicate("sfts")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit, offset], |row| {
+        Ok(json!({
+            "name": row.get::<_, String>(0)?,
+            "type": row.get::<_, String>(1)?,
+            "class_name": row.get::<_, Option<String>>(2)?,
+            "path": normalize_path(&row.get::<_, String>(3)?),
+            "line": row.get::<_, Option<i64>>(4)?,
+            "module_name": row.get::<_, Option<String>>(5)?,
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
+fn class_symbol_predicate(alias: &str) -> String {
+    format!(
+        "COALESCE({alias}.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM')"
+    )
+}
+
+fn searchable_sql() -> &'static str {
+    "lower(
+        COALESCE(sfts.name, '') || ' ' ||
+        COALESCE(sfts.type, '') || ' ' ||
+        COALESCE(sfts.class_name, '') || ' ' ||
+        COALESCE(sm.text, '') || ' ' ||
+        COALESCE(dp.full_path, '') || '/' || COALESCE(sn.text, '')
+    )"
+}
+
+fn search_tokens(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn escape_like(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Get all indexed C++/Unreal structs.
@@ -219,35 +327,6 @@ pub fn get_symbols_by_type(
     }
 
     Ok(json!(results))
-}
-
-/// Build a safe SQLite FTS query from user input.
-/// 根据用户输入构造相对安全的 SQLite FTS 查询。
-fn build_fts_query(input: &str) -> String {
-    let tokens = input
-        .split_whitespace()
-        .map(clean_fts_token)
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
-
-    if tokens.is_empty() {
-        return clean_fts_token(input);
-    }
-
-    tokens
-        .into_iter()
-        .map(|token| format!("{}*", token))
-        .collect::<Vec<_>>()
-        .join(" AND ")
-}
-
-/// Remove FTS syntax characters from one search token.
-/// 清理单个搜索 token 里的 FTS 语法字符。
-fn clean_fts_token(input: &str) -> String {
-    input
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
-        .collect()
 }
 
 /// Normalize Windows paths to slash-separated paths.

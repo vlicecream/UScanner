@@ -250,8 +250,13 @@ fn handle_state_query(
     persistent_cache_conn: Option<Arc<parking_lot::Mutex<rusqlite::Connection>>>,
 ) -> Result<Option<Value>> {
     match request {
-        QueryRequest::SearchSymbols { pattern, limit } => {
-            let value = search_symbols_with_engine(state, conn, engine_db_path, &pattern, limit)?;
+        QueryRequest::SearchSymbols {
+            pattern,
+            limit,
+            offset,
+        } => {
+            let value =
+                search_symbols_with_engine(state, conn, engine_db_path, &pattern, limit, offset)?;
             Ok(Some(value))
         }
 
@@ -716,9 +721,11 @@ fn search_symbols_with_engine(
     engine_db_path: Option<String>,
     pattern: &str,
     limit: usize,
+    offset: usize,
 ) -> Result<Value> {
     let limit = limit.clamp(1, 10_000);
-    let mut results = value_array(query::search::search_symbols(project_conn, pattern, limit)?);
+    let mut results =
+        value_array(query::search::search_symbols(project_conn, pattern, limit, offset)?);
     tag_source(&mut results, "project");
 
     if results.len() >= limit {
@@ -745,7 +752,7 @@ fn search_symbols_with_engine(
 
     let remaining = limit.saturating_sub(results.len()).max(1);
     let mut engine_results =
-        match query::search::search_symbols(&engine_conn, pattern, remaining) {
+        match query::search::search_symbols(&engine_conn, pattern, remaining, 0) {
             Ok(value) => value_array(value),
             Err(err) => {
                 warn!("Failed to query Engine DB symbols: {}", err);
