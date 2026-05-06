@@ -1,5 +1,34 @@
+//! Global find search rules.
+//! 全局搜索规则。
+//!
+//! `GlobalFind` is the single backend contract for `:UCore find` / `gf`.
+//! Lua sends only a semantic request: `pattern + limit + offset`.
+//! This Rust module owns SQL, DB schema details, text scanning, ranking,
+//! pagination, and future index changes.
+//! `GlobalFind` 是 `:UCore find` / `gf` 的统一后端契约。Lua 只发送
+//! `pattern + limit + offset` 语义请求；SQL、数据库结构、文本扫描、
+//! 排序、分页以及后续索引变更都由 Rust 侧负责。
+//!
+//! Ranking contract:
+//! 1. exact symbol names;
+//! 2. symbol name prefixes;
+//! 3. continuous symbol substrings;
+//! 4. exact/prefix file basenames;
+//! 5. file path substrings;
+//! 6. code text line substrings;
+//! 7. loose picker-side fuzzy only after backend-ranked results.
+//!
+//! This means `death` should prefer `Death*`, `*Death*`, `Death.cpp`, and real
+//! lines containing `death` before any loose `d ... e ... a ... t ... h` fuzzy
+//! result. Keep this rule here so UI changes do not accidentally move ranking
+//! back to the picker.
+//! 这意味着 `death` 应优先返回 `Death*`、`*Death*`、`Death.cpp` 和真正包含
+//! `death` 的代码行，最后才轮到松散字符级 fuzzy。这个规则写在这里，是为了
+//! 防止 UI 层改动时又把排序责任挪回 picker。
+
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
+use std::fs;
 
 use crate::db::project_path::PATH_CTE;
 
@@ -185,6 +214,52 @@ fn list_symbols(conn: &Connection, limit: usize, offset: usize) -> anyhow::Resul
     Ok(json!(results))
 }
 
+/// Unified global find for symbols, files, and code text.
+/// 统一搜索 symbol、文件名/路径和代码文本。
+///
+/// The ranking rule is intentionally duplicated from the file-level comment:
+/// symbol exact/prefix/substring results come first, then file basename/path
+/// results, then code text line matches. Lua must not rebuild this ranking with
+/// picker-side fuzzy sorting; it should preserve backend order and only request
+/// the next page with `offset`.
+/// 这里再次写明规则：symbol 完全/前缀/连续子串优先，其次文件名/路径，
+/// 最后代码文本行。Lua 不应该用 picker fuzzy 重排，只负责保持后端顺序并
+/// 用 `offset` 请求下一页。
+pub fn global_find(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Value> {
+    let pattern = pattern.trim();
+    let limit = limit.clamp(1, 500);
+    let offset = offset.min(1_000_000);
+
+    if pattern.is_empty() {
+        return list_symbols(conn, limit, offset);
+    }
+
+    let target = offset.saturating_add(limit);
+    let mut results = Vec::new();
+
+    extend_json_array(&mut results, search_symbols(conn, pattern, target.max(limit), 0)?);
+    extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
+
+    if results.len() < target {
+        extend_json_array(&mut results, search_text_for_global(conn, pattern, target)?);
+    }
+
+    dedupe_find_results(&mut results);
+
+    let page = results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    Ok(json!(page))
+}
+
 fn class_symbol_predicate(alias: &str) -> String {
     format!(
         "COALESCE({alias}.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM')"
@@ -214,6 +289,184 @@ fn escape_like(input: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+fn extend_json_array(target: &mut Vec<Value>, value: Value) {
+    if let Some(values) = value.as_array() {
+        target.extend(values.iter().cloned());
+    }
+}
+
+fn dedupe_find_results(results: &mut Vec<Value>) {
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|item| {
+        let path = item
+            .get("path")
+            .or_else(|| item.get("file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let line = item
+            .get("line")
+            .or_else(|| item.get("line_number"))
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let name = item
+            .get("name")
+            .or_else(|| item.get("symbol_name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let kind = item
+            .get("type")
+            .or_else(|| item.get("symbol_type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        seen.insert(format!("{kind}\t{path}\t{line}\t{name}"))
+    });
+}
+
+fn search_files_for_global(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<Value> {
+    let limit = limit.clamp(1, 500) as i64;
+    let query = pattern.to_ascii_lowercase();
+    let prefix_query = format!("{}%", escape_like(&query));
+    let contains_query = format!("%{}%", escape_like(&query));
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sn.text AS filename,
+            dp.full_path || '/' || sn.text AS path,
+            sm.text AS module_name,
+            rd.full_path AS module_root
+        FROM files f
+        JOIN strings sn ON f.filename_id = sn.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
+        WHERE lower(sn.text) LIKE ? ESCAPE '\'
+           OR lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\'
+        ORDER BY
+            CASE
+                WHEN lower(sn.text) = ? THEN 0
+                WHEN lower(sn.text) LIKE ? ESCAPE '\' THEN 1
+                WHEN lower(sn.text) LIKE ? ESCAPE '\' THEN 2
+                WHEN lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\' THEN 3
+                ELSE 9
+            END,
+            lower(sn.text) ASC,
+            lower(dp.full_path || '/' || sn.text) ASC
+        LIMIT ?
+        "#,
+        PATH_CTE
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![
+            contains_query,
+            contains_query,
+            query,
+            prefix_query,
+            contains_query,
+            contains_query,
+            limit
+        ],
+        |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "type": "file",
+                "path": normalize_path(&row.get::<_, String>(1)?),
+                "line": 1,
+                "module_name": row.get::<_, Option<String>>(2)?,
+                "module_root": row.get::<_, Option<String>>(3)?.map(|p| normalize_path(&p)),
+            }))
+        },
+    )?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
+fn search_text_for_global(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<Value> {
+    let needle = pattern.to_ascii_lowercase();
+    if needle.is_empty() {
+        return Ok(json!([]));
+    }
+
+    let paths = indexed_text_file_paths(conn)?;
+    let mut results = Vec::new();
+
+    for path in paths {
+        if results.len() >= limit {
+            break;
+        }
+
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        for (line_index, line) in content.lines().enumerate() {
+            if line.to_ascii_lowercase().contains(&needle) {
+                results.push(json!({
+                    "name": pattern,
+                    "type": "text",
+                    "path": normalize_path(&path),
+                    "line": (line_index + 1) as i64,
+                    "text": line.trim(),
+                }));
+
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(json!(results))
+}
+
+fn indexed_text_file_paths(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    let sql = format!(
+        r#"
+        {}
+        SELECT dp.full_path || '/' || sn.text AS path
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        WHERE lower(f.extension) IN (
+            'h', 'hh', 'hpp', 'hxx',
+            'c', 'cc', 'cpp', 'cxx',
+            'inl', 'ipp',
+            'cs', 'ini', 'json', 'uproject', 'uplugin'
+        )
+        ORDER BY path
+        "#,
+        PATH_CTE
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut paths = Vec::new();
+
+    for row in rows {
+        paths.push(normalize_path(&row?));
+    }
+
+    Ok(paths)
 }
 
 /// Get all indexed C++/Unreal structs.

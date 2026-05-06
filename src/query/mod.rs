@@ -58,6 +58,11 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
         } => {
             search::search_symbols(conn, &pattern, limit, offset)
         }
+        QueryRequest::GlobalFind {
+            pattern,
+            limit,
+            offset,
+        } => search::global_find(conn, &pattern, limit, offset),
 
         QueryRequest::GetStructsOnly => search::get_structs(conn),
 

@@ -542,6 +542,12 @@ pub enum QueryRequest {
         #[serde(default)]
         offset: usize,
     },
+    GlobalFind {
+        pattern: String,
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+    },
     FindSymbolUsages {
         symbol_name: String,
         #[serde(default)]

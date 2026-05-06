@@ -259,6 +259,14 @@ fn handle_state_query(
                 search_symbols_with_engine(state, conn, engine_db_path, &pattern, limit, offset)?;
             Ok(Some(value))
         }
+        QueryRequest::GlobalFind {
+            pattern,
+            limit,
+            offset,
+        } => {
+            let value = global_find_with_engine(state, conn, engine_db_path, &pattern, limit, offset)?;
+            Ok(Some(value))
+        }
 
         QueryRequest::FindSymbolUsages {
             symbol_name,
@@ -764,6 +772,54 @@ fn search_symbols_with_engine(
     merge_query_results(&mut results, engine_results, limit);
 
     Ok(json!(results))
+}
+
+fn global_find_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Value> {
+    let limit = limit.clamp(1, 10_000);
+    let mut results = value_array(query::search::global_find(project_conn, pattern, limit, offset)?);
+    tag_source(&mut results, "project");
+
+    if results.len() >= limit {
+        return Ok(Value::Array(results));
+    }
+
+    let Some(engine_db_path) = engine_db_path.filter(|path| !path.trim().is_empty()) else {
+        return Ok(Value::Array(results));
+    };
+
+    let engine_db_path = normalize_to_native(&engine_db_path);
+    if !Path::new(&engine_db_path).is_file() {
+        return Ok(Value::Array(results));
+    }
+
+    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            warn!("Failed to open Engine DB for global find: {}", err);
+            return Ok(Value::Array(results));
+        }
+    };
+    let remaining = limit.saturating_sub(results.len()).max(1);
+    let mut engine_results = match query::search::global_find(&engine_conn, pattern, remaining, 0) {
+        Ok(value) => value_array(value),
+        Err(err) => {
+            warn!("Failed to query Engine DB global find: {}", err);
+            Vec::new()
+        }
+    };
+
+    tag_source(&mut engine_results, "engine");
+    results.extend(engine_results);
+    results.truncate(limit);
+
+    Ok(Value::Array(results))
 }
 
 /// Convert a JSON array value into a Vec.
