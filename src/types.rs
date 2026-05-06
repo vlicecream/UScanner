@@ -542,6 +542,22 @@ pub enum QueryRequest {
         #[serde(default)]
         offset: usize,
     },
+    FastFind {
+        pattern: String,
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        scope: Option<String>,
+    },
+    SearchCodeText {
+        pattern: String,
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        scope: Option<String>,
+    },
     GlobalFind {
         pattern: String,
         limit: usize,

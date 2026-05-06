@@ -260,6 +260,117 @@ pub fn global_find(
     Ok(json!(page))
 }
 
+pub fn fast_find(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Value> {
+    let pattern = pattern.trim();
+    let limit = limit.clamp(1, 500);
+    let offset = offset.min(1_000_000);
+
+    if pattern.is_empty() {
+        return list_symbols(conn, limit, offset);
+    }
+
+    let target = offset.saturating_add(limit);
+    let mut results = Vec::new();
+
+    extend_json_array(&mut results, fast_find_symbols(conn, pattern, target.max(limit))?);
+    extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
+    dedupe_find_results(&mut results);
+
+    let page = results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    Ok(json!(page))
+}
+
+fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::Result<Value> {
+    let limit = limit.clamp(1, 500) as i64;
+    let query = pattern.to_ascii_lowercase();
+    let prefix_query = format!("{}%", escape_like(&query));
+    let contains_query = format!("%{}%", escape_like(&query));
+
+    let sql = format!(
+        r#"
+        {}
+        WITH matched AS (
+            SELECT
+                sfts.rowid_ref,
+                sfts.name,
+                sfts.type,
+                sfts.class_name,
+                CASE
+                    WHEN lower(sfts.name) = ? THEN 0
+                    WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 1
+                    WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 2
+                    WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\' THEN 3
+                    ELSE 9
+                END AS rank
+            FROM symbols_fts sfts
+            WHERE lower(sfts.name) LIKE ? ESCAPE '\'
+               OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\'
+            ORDER BY rank, lower(sfts.name) ASC
+            LIMIT ?
+        )
+        SELECT
+            matched.name,
+            matched.type,
+            matched.class_name,
+            dp.full_path || '/' || sn.text AS path,
+            COALESCE(c.line_number, mem.line_number)
+        FROM matched
+        LEFT JOIN classes c
+            ON c.id = matched.rowid_ref
+           AND {}
+        LEFT JOIN members mem
+            ON mem.id = matched.rowid_ref
+           AND NOT ({})
+        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        ORDER BY matched.rank, lower(matched.name) ASC, path ASC
+        "#,
+        PATH_CTE,
+        class_symbol_predicate("matched"),
+        class_symbol_predicate("matched")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![
+            query,
+            prefix_query,
+            contains_query,
+            contains_query,
+            contains_query,
+            contains_query,
+            limit
+        ],
+        |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "type": row.get::<_, String>(1)?,
+                "class_name": row.get::<_, Option<String>>(2)?,
+                "path": normalize_path(&row.get::<_, String>(3)?),
+                "line": row.get::<_, Option<i64>>(4)?,
+            }))
+        },
+    )?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
 fn class_symbol_predicate(alias: &str) -> String {
     format!(
         "COALESCE({alias}.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM')"
@@ -402,13 +513,25 @@ fn search_text_for_global(
     pattern: &str,
     limit: usize,
 ) -> anyhow::Result<Value> {
+    search_code_text(conn, pattern, limit, 0)
+}
+
+pub fn search_code_text(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Value> {
     let needle = pattern.to_ascii_lowercase();
     if needle.is_empty() {
         return Ok(json!([]));
     }
 
+    let limit = limit.clamp(1, 500);
+    let offset = offset.min(1_000_000);
     let paths = indexed_text_file_paths(conn)?;
     let mut results = Vec::new();
+    let mut skipped = 0usize;
 
     for path in paths {
         if results.len() >= limit {
@@ -421,6 +544,11 @@ fn search_text_for_global(
 
         for (line_index, line) in content.lines().enumerate() {
             if line.to_ascii_lowercase().contains(&needle) {
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+
                 results.push(json!({
                     "name": pattern,
                     "type": "text",

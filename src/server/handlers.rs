@@ -259,6 +259,40 @@ fn handle_state_query(
                 search_symbols_with_engine(state, conn, engine_db_path, &pattern, limit, offset)?;
             Ok(Some(value))
         }
+        QueryRequest::FastFind {
+            pattern,
+            limit,
+            offset,
+            scope,
+        } => {
+            let value = fast_find_with_scope(
+                state,
+                conn,
+                engine_db_path,
+                &pattern,
+                limit,
+                offset,
+                scope.as_deref(),
+            )?;
+            Ok(Some(value))
+        }
+        QueryRequest::SearchCodeText {
+            pattern,
+            limit,
+            offset,
+            scope,
+        } => {
+            let value = search_code_text_with_scope(
+                state,
+                conn,
+                engine_db_path,
+                &pattern,
+                limit,
+                offset,
+                scope.as_deref(),
+            )?;
+            Ok(Some(value))
+        }
         QueryRequest::GlobalFind {
             pattern,
             limit,
@@ -820,6 +854,91 @@ fn global_find_with_engine(
     results.truncate(limit);
 
     Ok(Value::Array(results))
+}
+
+fn fast_find_with_scope(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+    scope: Option<&str>,
+) -> Result<Value> {
+    let scope = scope.unwrap_or("both");
+    if scope == "engine" {
+        let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "fast find")? else {
+            return Ok(json!([]));
+        };
+        let mut results = value_array(query::search::fast_find(&engine_conn, pattern, limit, offset)?);
+        tag_source(&mut results, "engine");
+        return Ok(json!(results));
+    }
+
+    let mut results = value_array(query::search::fast_find(project_conn, pattern, limit, offset)?);
+    tag_source(&mut results, "project");
+
+    if scope == "project" || results.len() >= limit {
+        results.truncate(limit);
+        return Ok(json!(results));
+    }
+
+    let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "fast find")? else {
+        return Ok(json!(results));
+    };
+    let remaining = limit.saturating_sub(results.len()).max(1);
+    let mut engine_results = value_array(query::search::fast_find(&engine_conn, pattern, remaining, 0)?);
+    tag_source(&mut engine_results, "engine");
+    merge_query_results(&mut results, engine_results, limit);
+
+    Ok(json!(results))
+}
+
+fn search_code_text_with_scope(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+    scope: Option<&str>,
+) -> Result<Value> {
+    let scope = scope.unwrap_or("project");
+    if scope == "engine" {
+        let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "code text")? else {
+            return Ok(json!([]));
+        };
+        let mut results = value_array(query::search::search_code_text(&engine_conn, pattern, limit, offset)?);
+        tag_source(&mut results, "engine");
+        return Ok(json!(results));
+    }
+
+    let mut results = value_array(query::search::search_code_text(project_conn, pattern, limit, offset)?);
+    tag_source(&mut results, "project");
+    Ok(json!(results))
+}
+
+fn open_engine_query_connection(
+    state: Arc<AppState>,
+    engine_db_path: Option<String>,
+    label: &str,
+) -> Result<Option<rusqlite::Connection>> {
+    let Some(engine_db_path) = engine_db_path.filter(|path| !path.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    let engine_db_path = normalize_to_native(&engine_db_path);
+    if !Path::new(&engine_db_path).is_file() {
+        return Ok(None);
+    }
+
+    match state.get_read_only_connection(&engine_db_path) {
+        Ok(conn) => Ok(Some(conn)),
+        Err(err) => {
+            warn!("Failed to open Engine DB for {}: {}", label, err);
+            Ok(None)
+        }
+    }
 }
 
 /// Convert a JSON array value into a Vec.

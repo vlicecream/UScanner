@@ -58,6 +58,18 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
         } => {
             search::search_symbols(conn, &pattern, limit, offset)
         }
+        QueryRequest::FastFind {
+            pattern,
+            limit,
+            offset,
+            ..
+        } => search::fast_find(conn, &pattern, limit, offset),
+        QueryRequest::SearchCodeText {
+            pattern,
+            limit,
+            offset,
+            ..
+        } => search::search_code_text(conn, &pattern, limit, offset),
         QueryRequest::GlobalFind {
             pattern,
             limit,
