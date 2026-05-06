@@ -9,22 +9,21 @@
 //! `pattern + limit + offset` 语义请求；SQL、数据库结构、文本扫描、
 //! 排序、分页以及后续索引变更都由 Rust 侧负责。
 //!
-//! Ranking contract:
-//! 1. exact symbol names;
-//! 2. symbol name prefixes;
-//! 3. continuous symbol substrings;
-//! 4. exact/prefix file basenames;
-//! 5. file path substrings;
-//! 6. code text line substrings;
-//! 7. loose picker-side fuzzy only after backend-ranked results.
+//! Live find ranking contract:
+//! 1. project class-like results (`class`, `struct`, `enum`, `UCLASS`,
+//!    `USTRUCT`, `UENUM`);
+//! 2. project file basename/path results;
+//! 3. other project symbols such as functions, methods, properties, members;
+//! 4. project code text line matches;
+//! 5. Engine results appended later and ranked after project results;
+//! 6. loose picker-side fuzzy only breaks ties inside the staged results.
 //!
-//! This means `death` should prefer `Death*`, `*Death*`, `Death.cpp`, and real
-//! lines containing `death` before any loose `d ... e ... a ... t ... h` fuzzy
-//! result. Keep this rule here so UI changes do not accidentally move ranking
-//! back to the picker.
-//! 这意味着 `death` 应优先返回 `Death*`、`*Death*`、`Death.cpp` 和真正包含
-//! `death` 的代码行，最后才轮到松散字符级 fuzzy。这个规则写在这里，是为了
-//! 防止 UI 层改动时又把排序责任挪回 picker。
+//! `FastFind` intentionally omits code text so live search can show class/file
+//! results quickly. Lua starts `SearchCodeText` as a separate project-only stage
+//! and starts Engine `FastFind` as the final low-priority stage.
+//! 实时搜索规则：Project 类结果优先，其次文件名/路径，再是普通 symbol，
+//! 然后才是 Project 代码正文；Engine 结果后补并整体排在 Project 后面。
+//! `FastFind` 不查正文，正文由 Lua 另起 `SearchCodeText` 阶段追加。
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
@@ -35,17 +34,18 @@ use crate::db::project_path::PATH_CTE;
 /// Search indexed symbols with database-side ranking and pagination.
 /// 使用数据库侧排序和分页搜索已索引的 symbol。
 ///
-/// Ranking intentionally favors human "global find" expectations:
-/// - exact name matches first;
-/// - then name prefix matches;
-/// - then continuous substring matches in the symbol name;
+/// Ranking intentionally favors human "global find" expectations inside the
+/// symbol bucket:
+/// - exact symbol names first;
+/// - then symbol name prefixes;
+/// - then continuous symbol substrings;
 /// - then owner class / module / path matches;
 /// - only after those should picker-side fuzzy matching matter.
 ///
 /// This prevents a query such as `death` from being dominated by loose
 /// `d ... e ... a ... t ... h` fuzzy results before real `Death*` symbols.
-/// 这里的优先级是给全局搜索用的：完全匹配、前缀匹配、连续子串匹配优先，
-/// 最后才让前端 fuzzy 参与，避免 `death` 被松散的字符级匹配结果压到后面。
+/// 这里描述的是 symbol 桶内部排序：完全匹配、前缀匹配、连续子串优先，
+/// 再看所属 class/module/path，最后才让前端 fuzzy 参与。
 pub fn search_symbols(
     conn: &Connection,
     pattern: &str,
@@ -217,14 +217,12 @@ fn list_symbols(conn: &Connection, limit: usize, offset: usize) -> anyhow::Resul
 /// Unified global find for symbols, files, and code text.
 /// 统一搜索 symbol、文件名/路径和代码文本。
 ///
-/// The ranking rule is intentionally duplicated from the file-level comment:
-/// symbol exact/prefix/substring results come first, then file basename/path
-/// results, then code text line matches. Lua must not rebuild this ranking with
-/// picker-side fuzzy sorting; it should preserve backend order and only request
-/// the next page with `offset`.
-/// 这里再次写明规则：symbol 完全/前缀/连续子串优先，其次文件名/路径，
-/// 最后代码文本行。Lua 不应该用 picker fuzzy 重排，只负责保持后端顺序并
-/// 用 `offset` 请求下一页。
+/// Unified find used by non-live callers. Live `gf` uses staged requests
+/// (`FastFind`, `SearchCodeText`, then Engine `FastFind`) and the UI applies the
+/// final bucket order: Classes > Files > Symbols > Text > Engine. This function
+/// still keeps a stable backend order for broad one-shot searches.
+/// 非实时入口使用这个统一查询；实时 `gf` 走分阶段请求，并由 UI 应用最终桶排序：
+/// Classes > Files > Symbols > Text > Engine。这里仍保留一次性搜索的稳定后端顺序。
 pub fn global_find(
     conn: &Connection,
     pattern: &str,
@@ -260,6 +258,14 @@ pub fn global_find(
     Ok(json!(page))
 }
 
+/// Fast first-stage live find.
+///
+/// This returns only class/symbol rows and file rows. Code text is deliberately
+/// excluded because scanning source files can block the first screen. Lua runs
+/// `SearchCodeText` in parallel as a project-only append stage, and queries
+/// Engine with a separate low-priority `FastFind` request.
+/// 实时搜索第一阶段：只返回 class/symbol 和 file，不扫代码正文。代码正文由
+/// Lua 并行追加，Engine 另走低优先级 `FastFind`。
 pub fn fast_find(
     conn: &Connection,
     pattern: &str,
