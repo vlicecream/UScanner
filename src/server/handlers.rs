@@ -360,6 +360,44 @@ fn handle_state_query(
             Ok(Some(value))
         }
 
+        QueryRequest::GetHover {
+            content,
+            line,
+            character,
+            file_path,
+        } => {
+            let value = hover_with_engine(
+                state,
+                conn,
+                engine_db_path,
+                content,
+                line,
+                character,
+                file_path,
+            )?;
+
+            Ok(Some(value))
+        }
+
+        QueryRequest::GetSignatureHelp {
+            content,
+            line,
+            character,
+            file_path,
+        } => {
+            let value = signature_help_with_engine(
+                state,
+                conn,
+                engine_db_path,
+                content,
+                line,
+                character,
+                file_path,
+            )?;
+
+            Ok(Some(value))
+        }
+
         QueryRequest::GetAssetUsages { asset_path } => {
             Ok(Some(get_asset_usages(&state, root_key, &asset_path)))
         }
@@ -629,6 +667,188 @@ fn goto_implementation_with_engine(
     }
 
     Ok(engine_result)
+}
+
+/// Resolve hover info in the project DB, then fall back to the shared Engine DB.
+/// 先在项目 DB 里解析 hover，再回退到共享 Engine DB。
+fn hover_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    content: String,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    let mut project_result = query::goto::get_hover(
+        project_conn,
+        content.clone(),
+        line,
+        character,
+        file_path.clone(),
+    )?;
+
+    if !project_result.is_null() {
+        tag_value_source(&mut project_result, "project");
+        return Ok(project_result);
+    }
+
+    let Some(engine_db_path) = engine_db_path else {
+        return Ok(Value::Null);
+    };
+
+    let engine_db_path = normalize_to_native(&engine_db_path);
+    if !Path::new(&engine_db_path).is_file() {
+        return Ok(Value::Null);
+    }
+
+    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            warn!("Failed to open Engine DB for hover: {}", err);
+            return Ok(Value::Null);
+        }
+    };
+
+    let mut engine_result = match query::goto::get_hover(
+        &engine_conn,
+        content,
+        line,
+        character,
+        file_path,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Failed to query Engine DB hover: {}", err);
+            return Ok(Value::Null);
+        }
+    };
+
+    if !engine_result.is_null() {
+        tag_value_source(&mut engine_result, "engine");
+    }
+
+    Ok(engine_result)
+}
+
+/// Resolve signature help in the project DB, then append Engine DB overloads.
+/// 先在项目 DB 里解析签名帮助，再追加共享 Engine DB 的重载。
+fn signature_help_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    content: String,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    let mut project_result = query::goto::get_signature_help(
+        project_conn,
+        content.clone(),
+        line,
+        character,
+        file_path.clone(),
+    )?;
+
+    if project_result.is_null() {
+        let Some(engine_db_path) = engine_db_path else {
+            return Ok(Value::Null);
+        };
+
+        let engine_db_path = normalize_to_native(&engine_db_path);
+        if !Path::new(&engine_db_path).is_file() {
+            return Ok(Value::Null);
+        }
+
+        let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                warn!("Failed to open Engine DB for signature help: {}", err);
+                return Ok(Value::Null);
+            }
+        };
+
+        let mut engine_result = match query::goto::get_signature_help(
+            &engine_conn,
+            content,
+            line,
+            character,
+            file_path,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("Failed to query Engine DB signature help: {}", err);
+                return Ok(Value::Null);
+            }
+        };
+
+        if !engine_result.is_null() {
+            tag_value_source(&mut engine_result, "engine");
+        }
+
+        return Ok(engine_result);
+    }
+
+    if let Some(object) = project_result.as_object_mut() {
+        if let Some(signatures) = object.get_mut("signatures").and_then(Value::as_array_mut) {
+            tag_source(signatures, "project");
+        }
+    }
+
+    let Some(engine_db_path) = engine_db_path else {
+        return Ok(project_result);
+    };
+
+    let engine_db_path = normalize_to_native(&engine_db_path);
+    if !Path::new(&engine_db_path).is_file() {
+        return Ok(project_result);
+    }
+
+    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            warn!("Failed to open Engine DB for signature help: {}", err);
+            return Ok(project_result);
+        }
+    };
+
+    let engine_value = match query::goto::get_signature_help(
+        &engine_conn,
+        content,
+        line,
+        character,
+        file_path,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Failed to query Engine DB signature help: {}", err);
+            return Ok(project_result);
+        }
+    };
+
+    if engine_value.is_null() {
+        return Ok(project_result);
+    }
+
+    let Some(project_object) = project_result.as_object_mut() else {
+        return Ok(project_result);
+    };
+    let Some(project_signatures) = project_object
+        .get_mut("signatures")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(project_result);
+    };
+
+    let mut engine_signatures = engine_value
+        .get("signatures")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    tag_source(&mut engine_signatures, "engine");
+    merge_query_results(project_signatures, engine_signatures, 16);
+
+    Ok(project_result)
 }
 
 /// Find references in the project DB, then merge matching Engine DB results.

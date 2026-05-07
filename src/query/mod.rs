@@ -151,6 +151,18 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
             character,
             file_path,
         } => goto::goto_implementation(conn, content, line, character, file_path),
+        QueryRequest::GetHover {
+            content,
+            line,
+            character,
+            file_path,
+        } => goto::get_hover(conn, content, line, character, file_path),
+        QueryRequest::GetSignatureHelp {
+            content,
+            line,
+            character,
+            file_path,
+        } => goto::get_signature_help(conn, content, line, character, file_path),
 
         QueryRequest::FindSymbolInInheritanceChain {
             class_name,

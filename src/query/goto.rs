@@ -285,6 +285,20 @@ fn enclosing_function<'a>(node: Node<'a>) -> Option<Node<'a>> {
     None
 }
 
+fn find_child_by_type<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    for child in children_of(node) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+
+        if let Some(found) = find_child_by_type(child, kind) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
 fn find_enclosing_function_for_row<'a>(node: Node<'a>, row: usize) -> Option<Node<'a>> {
     if node.start_position().row > row || node.end_position().row < row {
         return None;
@@ -1013,6 +1027,709 @@ fn resolve_impl_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Optio
     ctx.enclosing_class.clone()
 }
 
+fn resolve_lookup_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Option<String> {
+    if let Some(ref qualifier) = ctx.qualifier {
+        return match ctx.qualifier_op.as_deref() {
+            Some("::") => {
+                if qualifier == "Super" {
+                    ctx.enclosing_class.clone()
+                } else {
+                    Some(clean_type(qualifier))
+                }
+            }
+            Some(".") | Some("->") => {
+                if qualifier == "this" {
+                    ctx.enclosing_class.clone()
+                } else if is_simple_identifier(qualifier) {
+                    infer_var_type(content, qualifier, Some(cursor_line))
+                        .or_else(|| Some(clean_type(qualifier)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+    }
+
+    ctx.enclosing_class.clone()
+}
+
+fn is_simple_identifier(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn function_signature_label(
+    owner_class: Option<&str>,
+    name: &str,
+    return_type: Option<&str>,
+    params: Option<&str>,
+) -> String {
+    let return_type = return_type
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("function");
+    let params = params
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("()");
+
+    if let Some(owner_class) = owner_class.map(|text| text.trim()).filter(|text| !text.is_empty()) {
+        return format!("{} {}::{}{}", return_type, owner_class, name, params);
+    }
+
+    format!("{} {}{}", return_type, name, params)
+}
+
+fn apply_hover_member_location(value: &mut Value, symbol_name: &str) {
+    fix_symbol_location(value, symbol_name);
+}
+
+fn find_member_hover_in_class(
+    conn: &Connection,
+    class_id: i64,
+    symbol_name: &str,
+    prefer_impl: bool,
+) -> Result<Option<Value>> {
+    let order_by = member_order_by_clause(prefer_impl);
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sm.text,
+            st.text,
+            m.line_number,
+            dp.full_path || '/' || sf.text,
+            sc.text,
+            m.access,
+            COALESCE(m.flags, ''),
+            COALESCE(m.detail, ''),
+            COALESCE(srt.text, '')
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN strings st ON m.type_id = st.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        LEFT JOIN strings srt ON m.return_type_id = srt.id
+        WHERE m.class_id = ?
+          AND sm.text = ?
+        {}
+        LIMIT 1
+        "#,
+        PATH_CTE,
+        order_by,
+    );
+
+    let mut result = conn
+        .query_row(&sql, params![class_id, symbol_name], |row| {
+            let name: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let class_name: String = row.get(4)?;
+            let detail: String = row.get(7)?;
+            let return_type: String = row.get(8)?;
+
+            Ok(json!({
+                "name": name.clone(),
+                "symbol_name": name.clone(),
+                "kind": kind,
+                "line_number": row.get::<_, i64>(2)?,
+                "file_path": normalize_path(&row.get::<_, String>(3)?),
+                "class_name": class_name.clone(),
+                "owner_class": class_name.clone(),
+                "access": row.get::<_, String>(5)?,
+                "flags": row.get::<_, String>(6)?,
+                "detail": detail.clone(),
+                "parameters": detail,
+                "return_type": return_type.clone(),
+                "label": function_signature_label(
+                    Some(&class_name),
+                    &name,
+                    Some(&return_type),
+                    None,
+                ),
+                "hover_kind": "member",
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        apply_hover_member_location(value, symbol_name);
+    }
+
+    Ok(result)
+}
+
+fn find_member_hover_in_inheritance_chain(
+    conn: &Connection,
+    class_name: &str,
+    symbol_name: &str,
+    prefer_impl: bool,
+) -> Result<Option<Value>> {
+    let mut ctx = GotoCtx::new(conn);
+    let start_ids = ctx.get_class_ids(class_name)?;
+
+    if start_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut queue = VecDeque::from(start_ids);
+    let mut visited = HashSet::new();
+
+    while let Some(class_id) = queue.pop_front() {
+        if !visited.insert(class_id) {
+            continue;
+        }
+
+        if let Some(result) = find_member_hover_in_class(conn, class_id, symbol_name, prefer_impl)? {
+            return Ok(Some(result));
+        }
+
+        for parent_id in ctx.get_parent_ids(class_id)? {
+            if !visited.contains(&parent_id) {
+                queue.push_back(parent_id);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_member_hover_anywhere(conn: &Connection, symbol_name: &str) -> Result<Option<Value>> {
+    let order_by = member_order_by_clause(false);
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sm.text,
+            st.text,
+            m.line_number,
+            dp.full_path || '/' || sf.text,
+            sc.text,
+            m.access,
+            COALESCE(m.flags, ''),
+            COALESCE(m.detail, ''),
+            COALESCE(srt.text, '')
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN strings st ON m.type_id = st.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        LEFT JOIN strings srt ON m.return_type_id = srt.id
+        WHERE sm.text = ?
+        {}
+        LIMIT 1
+        "#,
+        PATH_CTE,
+        order_by,
+    );
+
+    let mut result = conn
+        .query_row(&sql, [symbol_name], |row| {
+            let name: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let class_name: String = row.get(4)?;
+            let detail: String = row.get(7)?;
+            let return_type: String = row.get(8)?;
+
+            Ok(json!({
+                "name": name.clone(),
+                "symbol_name": name.clone(),
+                "kind": kind,
+                "line_number": row.get::<_, i64>(2)?,
+                "file_path": normalize_path(&row.get::<_, String>(3)?),
+                "class_name": class_name.clone(),
+                "owner_class": class_name.clone(),
+                "access": row.get::<_, String>(5)?,
+                "flags": row.get::<_, String>(6)?,
+                "detail": detail.clone(),
+                "parameters": detail,
+                "return_type": return_type.clone(),
+                "label": function_signature_label(
+                    Some(&class_name),
+                    &name,
+                    Some(&return_type),
+                    None,
+                ),
+                "hover_kind": "member",
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        apply_hover_member_location(value, symbol_name);
+    }
+
+    Ok(result)
+}
+
+fn find_type_hover(conn: &Connection, name: &str) -> Result<Option<Value>> {
+    let name = strip_namespace(name);
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sc.text,
+            c.line_number,
+            dp.full_path || '/' || sf.text,
+            c.symbol_type,
+            sb.text,
+            sm.text
+        FROM classes c
+        JOIN strings sc ON c.name_id = sc.id
+        LEFT JOIN strings sb ON c.base_class_id = sb.id
+        JOIN files f ON c.file_id = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE sc.text = ?
+        ORDER BY
+            {generated_priority},
+            {header_priority},
+            c.line_number
+        LIMIT 1
+        "#,
+        PATH_CTE,
+        generated_priority = GENERATED_PRIORITY_SQL,
+        header_priority = HEADER_PRIORITY_SQL
+    );
+
+    let mut result = conn
+        .query_row(&sql, [name.as_str()], |row| {
+            let symbol_name: String = row.get(0)?;
+            Ok(json!({
+                "name": symbol_name.clone(),
+                "symbol_name": symbol_name.clone(),
+                "line_number": row.get::<_, i64>(1)?,
+                "file_path": normalize_path(&row.get::<_, String>(2)?),
+                "kind": row.get::<_, String>(3)?,
+                "base_class": row.get::<_, Option<String>>(4)?,
+                "module_name": row.get::<_, Option<String>>(5)?,
+                "hover_kind": "type",
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_type_definition_location(conn, value, &name)?;
+    }
+
+    Ok(result)
+}
+
+#[derive(Debug, Clone)]
+struct SignatureCallContext {
+    function_name: String,
+    qualifier: Option<String>,
+    qualifier_op: Option<String>,
+    enclosing_class: Option<String>,
+    active_parameter: usize,
+}
+
+fn extract_signature_call_context(
+    content: &str,
+    line: u32,
+    character: u32,
+) -> Option<SignatureCallContext> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    parser.set_language(&language).ok()?;
+
+    let tree = parser.parse(content, None)?;
+    let root = tree.root_node();
+    let src = content.as_bytes();
+    let row = line as usize;
+    let col = character as usize;
+    let raw_node = cursor_node_at(root, row, col)?;
+    let mut current = Some(raw_node);
+
+    while let Some(node) = current {
+        if node.kind() == "call_expression" {
+            if let Some(ctx) = signature_call_context_from_node(node, src, row, col) {
+                return Some(ctx);
+            }
+        }
+        current = node.parent();
+    }
+
+    None
+}
+
+fn signature_call_context_from_node(
+    node: Node,
+    src: &[u8],
+    row: usize,
+    col: usize,
+) -> Option<SignatureCallContext> {
+    let function_node = node
+        .child_by_field_name("function")
+        .or_else(|| children_of(node).into_iter().find(|child| child.is_named()))?;
+    let arguments_node = node
+        .child_by_field_name("arguments")
+        .or_else(|| find_child_by_type(node, "argument_list"))?;
+
+    if !point_inside_node(arguments_node, row, col) {
+        return None;
+    }
+
+    let function_text = node_text(&function_node, src).trim();
+    let (function_name, qualifier, qualifier_op) = split_call_target_text(function_text)?;
+    let active_parameter = active_argument_index(arguments_node, row, col);
+    let enclosing_class = get_enclosing_class(function_node, src);
+
+    Some(SignatureCallContext {
+        function_name,
+        qualifier,
+        qualifier_op,
+        enclosing_class,
+        active_parameter,
+    })
+}
+
+fn point_inside_node(node: Node, row: usize, col: usize) -> bool {
+    let start = node.start_position();
+    let end = node.end_position();
+    let after_start = row > start.row || (row == start.row && col >= start.column);
+    let before_end = row < end.row || (row == end.row && col <= end.column);
+    after_start && before_end
+}
+
+fn active_argument_index(arguments_node: Node, row: usize, col: usize) -> usize {
+    let mut index = 0usize;
+    let mut named_count = 0usize;
+
+    for child in children_of(arguments_node) {
+        if !child.is_named() {
+            continue;
+        }
+
+        named_count += 1;
+        let end = child.end_position();
+        if end.row < row || (end.row == row && end.column <= col) {
+            index += 1;
+        }
+    }
+
+    if named_count == 0 {
+        return 0;
+    }
+
+    index.min(named_count.saturating_sub(1))
+}
+
+fn split_call_target_text(text: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let trimmed = text.trim();
+    let (name, name_start) = trailing_identifier(trimmed)?;
+    let prefix = trimmed[..name_start].trim_end();
+
+    if let Some(qualifier) = prefix.strip_suffix("::") {
+        return Some((name, Some(qualifier.trim().to_string()), Some("::".to_string())));
+    }
+    if let Some(qualifier) = prefix.strip_suffix("->") {
+        return Some((name, Some(qualifier.trim().to_string()), Some("->".to_string())));
+    }
+    if let Some(qualifier) = prefix.strip_suffix('.') {
+        return Some((name, Some(qualifier.trim().to_string()), Some(".".to_string())));
+    }
+
+    Some((name, None, None))
+}
+
+fn trailing_identifier(text: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut end = bytes.len();
+
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+
+    let mut start = end;
+    while start > 0 && is_identifier_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+
+    if start == end {
+        return None;
+    }
+
+    Some((text[start..end].to_string(), start))
+}
+
+fn resolve_signature_class(
+    ctx: &SignatureCallContext,
+    content: &str,
+    cursor_line: u32,
+) -> Option<String> {
+    if let Some(ref qualifier) = ctx.qualifier {
+        return match ctx.qualifier_op.as_deref() {
+            Some("::") => {
+                if qualifier == "Super" {
+                    ctx.enclosing_class.clone()
+                } else {
+                    Some(clean_type(qualifier))
+                }
+            }
+            Some(".") | Some("->") => {
+                if qualifier == "this" {
+                    ctx.enclosing_class.clone()
+                } else if is_simple_identifier(qualifier) {
+                    infer_var_type(content, qualifier, Some(cursor_line))
+                        .or_else(|| Some(clean_type(qualifier)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+    }
+
+    ctx.enclosing_class.clone()
+}
+
+fn collect_member_signature_items(
+    conn: &Connection,
+    class_id: i64,
+    function_name: &str,
+) -> Result<Vec<Value>> {
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sm.text,
+            m.line_number,
+            dp.full_path || '/' || sf.text,
+            sc.text,
+            COALESCE(m.detail, ''),
+            COALESCE(srt.text, ''),
+            m.access,
+            COALESCE(m.flags, '')
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN strings st ON m.type_id = st.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        LEFT JOIN strings srt ON m.return_type_id = srt.id
+        WHERE m.class_id = ?
+          AND sm.text = ?
+          AND lower(st.text) LIKE '%function%'
+        ORDER BY
+            CASE WHEN m.access = 'impl' THEN 1 ELSE 0 END,
+            {generated_priority},
+            {header_priority},
+            m.line_number
+        "#,
+        PATH_CTE,
+        generated_priority = GENERATED_PRIORITY_SQL,
+        header_priority = HEADER_PRIORITY_SQL
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![class_id, function_name], |row| {
+        let name: String = row.get(0)?;
+        let line_number: i64 = row.get(1)?;
+        let file_path = normalize_path(&row.get::<_, String>(2)?);
+        let class_name: String = row.get(3)?;
+        let detail: String = row.get(4)?;
+        let return_type: String = row.get(5)?;
+
+        Ok(json!({
+            "name": name.clone(),
+            "class_name": class_name.clone(),
+            "owner_class": class_name.clone(),
+            "parameters": detail.clone(),
+            "detail": detail.clone(),
+            "return_type": return_type.clone(),
+            "access": row.get::<_, String>(6)?,
+            "flags": row.get::<_, String>(7)?,
+            "file_path": file_path,
+            "line_number": line_number,
+            "label": function_signature_label(
+                Some(&class_name),
+                &name,
+                Some(&return_type),
+                Some(&detail),
+            ),
+            "kind": "function",
+        }))
+    })?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        let mut value = row?;
+        fix_symbol_location(&mut value, function_name);
+        items.push(value);
+    }
+
+    Ok(items)
+}
+
+fn push_unique_signature(items: &mut Vec<Value>, item: Value) {
+    let label = item.get("label").and_then(Value::as_str).unwrap_or_default();
+    let file_path = item
+        .get("file_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let line_number = item
+        .get("line_number")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    let exists = items.iter().any(|current| {
+        current.get("label").and_then(Value::as_str).unwrap_or_default() == label
+            && current
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                == file_path
+            && current
+                .get("line_number")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                == line_number
+    });
+
+    if !exists {
+        items.push(item);
+    }
+}
+
+fn collect_member_signatures_in_inheritance(
+    conn: &Connection,
+    class_name: &str,
+    function_name: &str,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let mut ctx = GotoCtx::new(conn);
+    let start_ids = ctx.get_class_ids(class_name)?;
+    if start_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut queue = VecDeque::from(start_ids);
+    let mut visited = HashSet::new();
+    let mut items = Vec::new();
+
+    while let Some(class_id) = queue.pop_front() {
+        if !visited.insert(class_id) {
+            continue;
+        }
+
+        for item in collect_member_signature_items(conn, class_id, function_name)? {
+            push_unique_signature(&mut items, item);
+            if items.len() >= limit {
+                return Ok(items);
+            }
+        }
+
+        for parent_id in ctx.get_parent_ids(class_id)? {
+            if !visited.contains(&parent_id) {
+                queue.push_back(parent_id);
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+fn collect_function_signatures_anywhere(
+    conn: &Connection,
+    function_name: &str,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sm.text,
+            m.line_number,
+            dp.full_path || '/' || sf.text,
+            sc.text,
+            COALESCE(m.detail, ''),
+            COALESCE(srt.text, ''),
+            m.access,
+            COALESCE(m.flags, '')
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN strings st ON m.type_id = st.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        LEFT JOIN strings srt ON m.return_type_id = srt.id
+        WHERE sm.text = ?
+          AND lower(st.text) LIKE '%function%'
+        ORDER BY
+            CASE WHEN m.access = 'impl' THEN 1 ELSE 0 END,
+            {generated_priority},
+            {header_priority},
+            m.line_number
+        LIMIT ?
+        "#,
+        PATH_CTE,
+        generated_priority = GENERATED_PRIORITY_SQL,
+        header_priority = HEADER_PRIORITY_SQL
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![function_name, limit as i64], |row| {
+        let name: String = row.get(0)?;
+        let line_number: i64 = row.get(1)?;
+        let file_path = normalize_path(&row.get::<_, String>(2)?);
+        let class_name: String = row.get(3)?;
+        let detail: String = row.get(4)?;
+        let return_type: String = row.get(5)?;
+
+        Ok(json!({
+            "name": name.clone(),
+            "class_name": class_name.clone(),
+            "owner_class": class_name.clone(),
+            "parameters": detail.clone(),
+            "detail": detail.clone(),
+            "return_type": return_type.clone(),
+            "access": row.get::<_, String>(6)?,
+            "flags": row.get::<_, String>(7)?,
+            "file_path": file_path,
+            "line_number": line_number,
+            "label": function_signature_label(
+                Some(&class_name),
+                &name,
+                Some(&return_type),
+                Some(&detail),
+            ),
+            "kind": "function",
+        }))
+    })?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        let mut value = row?;
+        fix_symbol_location(&mut value, function_name);
+        push_unique_signature(&mut items, value);
+        if items.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(items)
+}
+
 fn find_local_declaration(
     content: &str,
     symbol_name: &str,
@@ -1211,6 +1928,95 @@ pub fn goto_implementation(
     file_path: Option<String>,
 ) -> Result<Value> {
     goto_definition_inner(conn, content, line, character, file_path, true)
+}
+
+/// Resolve hover information for the symbol under cursor.
+/// 解析当前光标符号的 hover 信息。
+pub fn get_hover(
+    conn: &Connection,
+    content: String,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    let Some(ctx) = extract_cursor_context(&content, line, character) else {
+        return Ok(Value::Null);
+    };
+
+    if let Some(local_decl) = find_local_declaration(&content, &ctx.symbol, line, character) {
+        let mut value = json!({
+            "name": ctx.symbol,
+            "symbol_name": ctx.symbol,
+            "kind": "local",
+            "type_name": local_decl.type_name.clone(),
+            "line_number": (local_decl.row + 1) as i64,
+            "col": local_decl.col as i64,
+            "file_path": file_path.as_ref().map(|path| normalize_path(path)),
+            "class_name": ctx.enclosing_class.clone(),
+            "hover_kind": "local",
+        });
+
+        if let Some(type_name) = local_decl.type_name {
+            if let Some(resolved_type) = find_type_hover(conn, &type_name)? {
+                value["resolved_type"] = resolved_type;
+            }
+        }
+
+        return Ok(value);
+    }
+
+    if let Some(resolved_class) = resolve_lookup_class(&ctx, &content, line) {
+        if let Some(result) =
+            find_member_hover_in_inheritance_chain(conn, &resolved_class, &ctx.symbol, false)?
+        {
+            return Ok(result);
+        }
+    }
+
+    if let Some(result) = find_type_hover(conn, &ctx.symbol)? {
+        return Ok(result);
+    }
+
+    if let Some(result) = find_member_hover_anywhere(conn, &ctx.symbol)? {
+        return Ok(result);
+    }
+
+    Ok(Value::Null)
+}
+
+/// Resolve signature help for the call expression around cursor.
+/// 解析当前光标所在调用表达式的签名帮助。
+pub fn get_signature_help(
+    conn: &Connection,
+    content: String,
+    line: u32,
+    character: u32,
+    _file_path: Option<String>,
+) -> Result<Value> {
+    let Some(ctx) = extract_signature_call_context(&content, line, character) else {
+        return Ok(Value::Null);
+    };
+
+    let mut signatures = if let Some(class_name) = resolve_signature_class(&ctx, &content, line) {
+        collect_member_signatures_in_inheritance(conn, &class_name, &ctx.function_name, 16)?
+    } else {
+        Vec::new()
+    };
+
+    if signatures.is_empty() {
+        signatures = collect_function_signatures_anywhere(conn, &ctx.function_name, 16)?;
+    }
+
+    if signatures.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    Ok(json!({
+        "name": ctx.function_name,
+        "active_parameter": ctx.active_parameter,
+        "active_signature": 0,
+        "signatures": signatures,
+    }))
 }
 
 fn goto_definition_inner(

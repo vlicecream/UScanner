@@ -606,6 +606,20 @@ pub enum QueryRequest {
         #[serde(default)]
         file_path: Option<String>,
     },
+    GetHover {
+        content: String,
+        line: u32,
+        character: u32,
+        #[serde(default)]
+        file_path: Option<String>,
+    },
+    GetSignatureHelp {
+        content: String,
+        line: u32,
+        character: u32,
+        #[serde(default)]
+        file_path: Option<String>,
+    },
     GetCompletions {
         content: String,
         line: u32,
