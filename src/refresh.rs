@@ -267,7 +267,7 @@ fn discover_project(ctx: &RefreshContext, reporter: Arc<dyn ProgressReporter>) -
                 build_files.lock().push((path.to_path_buf(), owner));
             }
 
-            if entry.file_type().map_or(false, |ty| ty.is_file()) && include_extensions.contains(&extension) && !is_generated_path(&normalize_path(path)) {
+            if entry.file_type().map_or(false, |ty| ty.is_file()) && include_extensions.contains(&extension) {
                 discovered_files.lock().push(DiscoveredFile {
                     path: normalize_path(path),
                     extension,
@@ -1023,14 +1023,6 @@ fn is_build_cs(path: &Path) -> bool {
 
 fn is_source_extension(ext: &str) -> bool {
     SOURCE_EXTENSIONS.contains(&ext)
-}
-
-fn is_generated_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".gen.cpp")
-        || lower.ends_with(".generated.h")
-        || lower.ends_with(".generated.cpp")
-        || lower.contains(".generated.")
 }
 
 fn is_header_extension(ext: &str) -> bool {
