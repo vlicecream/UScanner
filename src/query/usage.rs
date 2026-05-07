@@ -398,10 +398,7 @@ fn collect_candidate_files(
     }
 
     let Some(UsageScope::Member(member_scope)) = scope else {
-        return Ok(CandidateFiles {
-            file_paths: Vec::new(),
-            found_definition: false,
-        });
+        return collect_unresolved_candidate_files(conn, symbol_name, current_file);
     };
 
     let def_ids = find_member_definition_file_ids(conn, symbol_name, &member_scope.member_owner_class)?;
@@ -420,6 +417,59 @@ fn collect_candidate_files(
     if let Some(current) = current_file {
         if let Some(id) = find_file_id(conn, current)? {
             candidate_ids.insert(id);
+        }
+    }
+
+    let mut ids = candidate_ids.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.truncate(MAX_FILES);
+
+    let mut file_paths = get_file_paths_by_ids(conn, &ids)?;
+    file_paths.sort();
+    file_paths.dedup();
+
+    Ok(CandidateFiles {
+        file_paths,
+        found_definition,
+    })
+}
+
+/// Collect fallback candidate files when the cursor scope cannot be resolved.
+/// 当无法解析光标作用域时，回退收集一个可搜索的候选文件集合。
+fn collect_unresolved_candidate_files(
+    conn: &Connection,
+    symbol_name: &str,
+    current_file: Option<&str>,
+) -> Result<CandidateFiles> {
+    let mut candidate_ids = HashSet::new();
+    let mut found_definition = false;
+
+    for id in find_symbol_definition_file_ids(conn, symbol_name)? {
+        found_definition = true;
+        candidate_ids.insert(id);
+    }
+
+    for id in find_symbol_call_file_ids(conn, symbol_name)? {
+        candidate_ids.insert(id);
+    }
+
+    let seed_ids = candidate_ids.iter().copied().collect::<Vec<_>>();
+    for id in find_including_file_ids(conn, &seed_ids)? {
+        candidate_ids.insert(id);
+    }
+
+    if let Some(current) = current_file {
+        if let Some(id) = find_file_id(conn, current)? {
+            candidate_ids.insert(id);
+        }
+    }
+
+    if candidate_ids.is_empty() {
+        for id in collect_all_file_ids(conn)? {
+            candidate_ids.insert(id);
+            if candidate_ids.len() >= MAX_FILES {
+                break;
+            }
         }
     }
 
@@ -463,6 +513,100 @@ fn find_member_definition_file_ids(
         &mut seen,
         &mut ids,
     )?;
+
+    Ok(ids)
+}
+
+/// Find definition file ids for class/member/enum symbols matching one name.
+/// 查找与符号名匹配的 class/member/enum 定义文件。
+fn find_symbol_definition_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+
+    collect_ids(
+        conn,
+        r#"
+        SELECT DISTINCT f.id
+        FROM classes c
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON c.file_id = f.id
+        WHERE sc.text = ?
+        "#,
+        &[symbol_name],
+        &mut seen,
+        &mut ids,
+    )?;
+
+    collect_ids(
+        conn,
+        r#"
+        SELECT DISTINCT COALESCE(m.file_id, c.file_id)
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN classes c ON m.class_id = c.id
+        WHERE sm.text = ?
+          AND COALESCE(m.file_id, c.file_id) IS NOT NULL
+        "#,
+        &[symbol_name],
+        &mut seen,
+        &mut ids,
+    )?;
+
+    collect_ids(
+        conn,
+        r#"
+        SELECT DISTINCT ev.file_id
+        FROM enum_values ev
+        JOIN strings se ON ev.name_id = se.id
+        WHERE se.text = ?
+          AND ev.file_id IS NOT NULL
+        "#,
+        &[symbol_name],
+        &mut seen,
+        &mut ids,
+    )?;
+
+    Ok(ids)
+}
+
+/// Find files containing indexed symbol calls with the given name.
+/// 查找包含指定调用名的文件。
+fn find_symbol_call_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+
+    collect_ids(
+        conn,
+        r#"
+        SELECT DISTINCT sc.file_id
+        FROM symbol_calls sc
+        JOIN strings ss ON sc.name_id = ss.id
+        WHERE ss.text = ?
+        "#,
+        &[symbol_name],
+        &mut seen,
+        &mut ids,
+    )?;
+
+    Ok(ids)
+}
+
+/// Collect all indexed file ids as a last-resort unresolved usage scope fallback.
+/// 作为最后兜底，收集所有已索引文件 id。
+fn collect_all_file_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT f.id
+        FROM files f
+        ORDER BY f.id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
 
     Ok(ids)
 }
