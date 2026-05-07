@@ -24,6 +24,10 @@ pub async fn handle_file_change(state: Arc<AppState>, path: PathBuf) {
 
     let ext = file_extension(&path);
 
+    if is_generated_path(&normalized_path) {
+        return;
+    }
+
     if ext == "ini" {
         mark_config_cache_dirty(&state, &project.root_key);
         return;
@@ -250,6 +254,16 @@ fn file_extension(path: &Path) -> String {
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_ascii_lowercase()
+}
+
+/// Skip Unreal Header Tool generated files.
+/// 跳过 Unreal Header Tool 生成的中间文件。
+fn is_generated_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".gen.cpp")
+        || lower.ends_with(".generated.h")
+        || lower.ends_with(".generated.cpp")
+        || lower.contains(".generated.")
 }
 
 /// Get file modified time in Unix seconds.

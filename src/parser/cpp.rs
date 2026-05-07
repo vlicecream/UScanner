@@ -191,6 +191,15 @@ pub fn process_file(
     query: &Query,
     include_query: &Query,
 ) -> anyhow::Result<ParseResult> {
+    if is_generated_path(&input.path) {
+        return Ok(ParseResult {
+            path: input.path.clone(),
+            status: "skipped".to_string(),
+            mtime: input.mtime,
+            data: None,
+            module_id: input.module_id,
+        });
+    }
     let file = File::open(&input.path)
         .with_context(|| format!("failed to open {}", input.path))?;
 
@@ -332,6 +341,14 @@ pub fn parse_content(
 
 /// Cheap header pre-filter.
 /// 低成本头文件预过滤。
+fn is_generated_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".gen.cpp")
+        || lower.ends_with(".generated.h")
+        || lower.ends_with(".generated.cpp")
+        || lower.contains(".generated.")
+}
+
 fn looks_like_interesting_unreal_header(content: &[u8]) -> bool {
     contains_bytes(content, b"#include")
         || contains_bytes(content, b"UCLASS")
