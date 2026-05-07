@@ -20,6 +20,8 @@ use crate::types::{
 };
 use crate::{db, query, refresh, scanner};
 
+const SERVER_PROTOCOL_VERSION: u32 = 2;
+
 // -----------------------------------------------------------------------------
 // Request types
 // -----------------------------------------------------------------------------
@@ -1274,9 +1276,17 @@ pub async fn handle_scan(state: &AppState, params: &Value) -> Result<Value> {
 pub async fn get_status(state: &AppState) -> Result<Value> {
     let projects = state.projects.lock();
     let clients = state.active_clients.lock();
+    let exe_path = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+    let server_version = env!("CARGO_PKG_VERSION");
 
     Ok(json!({
         "status": "running",
+        "protocol_version": SERVER_PROTOCOL_VERSION,
+        "server_version": server_version,
+        "build_id": format!("{}-p{}", server_version, SERVER_PROTOCOL_VERSION),
+        "exe_path": exe_path,
         "active_projects": projects.keys().cloned().collect::<Vec<_>>(),
         "active_clients": clients.iter().copied().collect::<Vec<_>>(),
     }))
