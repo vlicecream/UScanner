@@ -67,6 +67,10 @@ pub fn process_diagnostics(
 ) -> Result<Value> {
     let mut items = Vec::new();
     items.extend(unreal_rule_diagnostics(content, file_path.as_deref())?);
+    items.extend(incomplete_member_declaration_diagnostics(
+        content,
+        file_path.as_deref(),
+    )?);
     items.extend(missing_implementation_diagnostics(content, file_path.as_deref())?);
     Ok(json!({ "items": items }))
 }
@@ -202,6 +206,100 @@ fn missing_implementation_diagnostics(
         &mut items,
     );
     Ok(items)
+}
+
+fn incomplete_member_declaration_diagnostics(
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(header_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_header_file(header_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let root = tree.root_node();
+    let mut items = Vec::new();
+    collect_incomplete_member_decl_items(root, content, header_path, &mut items);
+    Ok(items)
+}
+
+fn collect_incomplete_member_decl_items(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    if let Some(item) = incomplete_member_declaration_item(node, content, file_path) {
+        items.push(item);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_incomplete_member_decl_items(child, content, file_path, items);
+    }
+}
+
+fn incomplete_member_declaration_item(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+) -> Option<DiagnosticItem> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+
+    let text = node_text(node, content).trim().to_string();
+    if text.is_empty()
+        || text.contains(';')
+        || text.contains('{')
+        || !text.contains('(')
+        || !text.contains(')')
+    {
+        return None;
+    }
+
+    let Some(_class_name) = find_enclosing_class_name(node, content) else {
+        return None;
+    };
+
+    let Some(declarator) = find_child_by_field(node, "declarator") else {
+        return None;
+    };
+    let Some(name_node) = find_name_node(declarator) else {
+        return None;
+    };
+
+    let start = declaration_start(node, declarator);
+    let end = name_node.end_position();
+    let name = node_text(name_node, content).trim().to_string();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(
+        DiagnosticItem::new(
+            Some(file_path),
+            start.row as u32,
+            start.column as u32,
+            DiagnosticSeverity::Error,
+            "UCore",
+            "UECPP002",
+            format!("Incomplete member function declaration for {}. Expected ';' or a function body.", name),
+        )
+        .with_end(end.row as u32, end.column as u32),
+    )
 }
 
 fn collect_missing_impl_items(
@@ -1063,6 +1161,7 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
+        assert!(items.iter().any(|item| item["code"] == "UECPP002"));
 
         let _ = std::fs::remove_dir_all(root);
     }
