@@ -4064,6 +4064,7 @@ fn template_argument(inner: &str, index: usize) -> &str {
 /// Get enclosing class name.
 /// 获取当前 node 所在 class 名。
 fn enclosing_class(node: Node, content: &str) -> Option<String> {
+    let fallback_offset = node.end_byte();
     let mut current = Some(node);
 
     while let Some(node) = current {
@@ -4077,11 +4078,9 @@ fn enclosing_class(node: Node, content: &str) -> Option<String> {
                 }
             }
 
-            "function_definition" => {
-                if let Some(decl) = node.child_by_field_name("declarator") {
-                    if let Some(scope) = find_qualified_scope(decl) {
-                        return Some(clean_type(node_text(scope, content)));
-                    }
+            "function_definition" | "unreal_function_definition" => {
+                if let Some(owner) = scope_name_from_declarator(node, content) {
+                    return Some(owner);
                 }
             }
 
@@ -4091,7 +4090,78 @@ fn enclosing_class(node: Node, content: &str) -> Option<String> {
         current = node.parent();
     }
 
+    enclosing_class_from_text(content, fallback_offset)
+}
+
+fn scope_name_from_declarator(node: Node, content: &str) -> Option<String> {
+    let decl = node.child_by_field_name("declarator")?;
+    let owner = find_qualified_scope(decl)
+        .map(|scope| clean_type(node_text(scope, content)))
+        .or_else(|| scope_name_from_declarator_text(decl, content))?;
+
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+fn scope_name_from_declarator_text(node: Node, content: &str) -> Option<String> {
+    let text = node_text(node, content).trim();
+    let head = text.split('(').next()?.trim();
+    let scope = head.rsplit_once("::")?.0.trim();
+    let owner = clean_type(scope);
+
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+fn enclosing_class_from_text(content: &str, offset: usize) -> Option<String> {
+    let before = &content[..offset.min(content.len())];
+    let mut depth = 0usize;
+
+    for (index, ch) in before.char_indices().rev() {
+        match ch {
+            '}' => depth += 1,
+            '{' => {
+                if depth == 0 {
+                    if let Some(owner) = scope_name_before_block(&before[..index]) {
+                        return Some(owner);
+                    }
+                } else {
+                    depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
     None
+}
+
+fn scope_name_before_block(prefix: &str) -> Option<String> {
+    let header_start = prefix
+        .rfind(|ch| matches!(ch, ';' | '{' | '}'))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let signature = prefix[header_start..].trim();
+    let head = signature.split('(').next()?.trim();
+    let scope = head.rsplit_once("::")?.0.trim();
+    let scope = scope
+        .rsplit(|ch: char| ch.is_whitespace() || matches!(ch, '*' | '&'))
+        .next()
+        .unwrap_or(scope)
+        .trim();
+    let owner = clean_type(scope);
+
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner)
+    }
 }
 
 /// Find scope inside qualified_identifier.
@@ -5211,6 +5281,65 @@ public:
         );
 
         assert!(has_label(&member_items, "CancelAllAbilities"));
+    }
+
+    #[test]
+    fn out_of_class_definition_surfaces_engine_parent_members() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let file_id: i64 = project_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let ability_child_id = insert_class(&project_conn, "UMyAbility", file_id);
+        insert_external_inheritance(&project_conn, ability_child_id, "UGameplayAbility");
+
+        let gameplay_ability_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member(
+            &engine_conn,
+            gameplay_ability_id,
+            "EndAbility",
+            "function",
+            Some("void"),
+            "protected",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+void UMyAbility::ActivateAbility()
+{
+    EndAb/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "EndAbility"));
+    }
+
+    #[test]
+    fn out_of_class_definition_infers_enclosing_class() {
+        let source = r#"
+void UMyAbility::ActivateAbility()
+{
+    EndAb/*cursor*/
+}
+"#;
+        let (content, line, character) = source_with_cursor(source);
+
+        let mut parser = Parser::new();
+        let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+
+        let tree = parser.parse(&content, None).unwrap();
+        let node = cursor_node(tree.root_node(), line, character).unwrap();
+        assert_eq!(enclosing_class(node, &content).as_deref(), Some("UMyAbility"));
     }
 
     #[test]
