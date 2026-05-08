@@ -3,9 +3,12 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tree_sitter::Parser;
+
+use crate::types::OpenBufferOverlay;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +67,7 @@ pub fn process_diagnostics(
     _engine_conn: Option<&Connection>,
     content: &str,
     file_path: Option<String>,
+    open_files: &[OpenBufferOverlay],
 ) -> Result<Value> {
     let mut items = Vec::new();
     items.extend(unreal_rule_diagnostics(content, file_path.as_deref())?);
@@ -71,7 +75,11 @@ pub fn process_diagnostics(
         content,
         file_path.as_deref(),
     )?);
-    items.extend(missing_implementation_diagnostics(content, file_path.as_deref())?);
+    items.extend(missing_implementation_diagnostics(
+        content,
+        file_path.as_deref(),
+        open_files,
+    )?);
     Ok(json!({ "items": items }))
 }
 
@@ -168,6 +176,7 @@ fn unreal_rule_diagnostics(content: &str, file_path: Option<&str>) -> Result<Vec
 fn missing_implementation_diagnostics(
     content: &str,
     file_path: Option<&str>,
+    open_files: &[OpenBufferOverlay],
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(header_path) = file_path else {
         return Ok(Vec::new());
@@ -186,13 +195,17 @@ fn missing_implementation_diagnostics(
     };
 
     let root = tree.root_node();
+    let overlay_texts = open_file_texts(open_files);
     let source_candidates = header_to_source_candidates(header_path);
     let source_texts = source_candidates
         .iter()
         .filter_map(|path| {
-            fs::read_to_string(path)
-                .ok()
-                .map(|text| (path.replace('\\', "/"), normalize_space(&text)))
+            let normalized_path = path.replace('\\', "/");
+            overlay_texts
+                .get(&normalized_path)
+                .cloned()
+                .or_else(|| fs::read_to_string(path).ok().map(|text| normalize_space(&text)))
+                .map(|text| (normalized_path, text))
         })
         .collect::<Vec<_>>();
 
@@ -206,6 +219,21 @@ fn missing_implementation_diagnostics(
         &mut items,
     );
     Ok(items)
+}
+
+fn open_file_texts(open_files: &[OpenBufferOverlay]) -> HashMap<String, String> {
+    let mut texts = HashMap::new();
+
+    for item in open_files {
+        let path = item.file_path.replace('\\', "/");
+        if path.is_empty() {
+            continue;
+        }
+
+        texts.insert(path, normalize_space(&item.content));
+    }
+
+    texts
 }
 
 fn incomplete_member_declaration_diagnostics(
@@ -1098,6 +1126,7 @@ mod tests {
             None,
             "UCLASS()\nclass AThing : public UObject {\n};\n",
             Some("C:/Project/AThing.h".to_string()),
+            &[],
         )
         .unwrap();
         let items = value["items"].as_array().unwrap();
@@ -1124,6 +1153,7 @@ mod tests {
             None,
             "UENUM(BlueprintType)\nenum class EThing { One };\n",
             Some("C:/Project/EThing.h".to_string()),
+            &[],
         )
         .unwrap();
         let items = value["items"].as_array().unwrap();
@@ -1144,6 +1174,7 @@ mod tests {
             None,
             "class UMyActor\n{\npublic:\n    void DoThing();\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
         )
         .unwrap();
 
@@ -1167,6 +1198,7 @@ mod tests {
             None,
             "class UMyActor\n{\npublic:\n    void DoThing()\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
         )
         .unwrap();
 
@@ -1198,6 +1230,39 @@ mod tests {
             None,
             "class UMyActor\n{\npublic:\n    void DoThing();\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn does_not_warn_when_matching_cpp_definition_exists_in_overlay() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("has_impl_overlay");
+        let header = root.join("Source/Game/Public/MyActor.h");
+        let source = root.join("Source/Game/Private/MyActor.cpp");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "#include \"MyActor.h\"\n").unwrap();
+
+        let overlays = vec![OpenBufferOverlay {
+            file_path: source.to_string_lossy().replace('\\', "/"),
+            content: "#include \"MyActor.h\"\n\nvoid UMyActor::DoThing()\n{\n}\n".to_string(),
+        }];
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyActor\n{\npublic:\n    void DoThing();\n};\n",
+            Some(header.to_string_lossy().replace('\\', "/")),
+            &overlays,
         )
         .unwrap();
 
@@ -1228,6 +1293,7 @@ mod tests {
             None,
             "class UMyActor\n{\npublic:\n    explicit UMyActor(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
         )
         .unwrap();
 
@@ -1258,6 +1324,7 @@ mod tests {
             None,
             "UCLASS()\nclass UMyAbility\n{\n    GENERATED_BODY()\npublic:\n    explicit UMyAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());\nprivate:\n    void StartDeath();\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
         )
         .unwrap();
 
@@ -1301,6 +1368,7 @@ mod tests {
             None,
             "class UMyAbility\n{\npublic:\n    UFUNCTION(BlueprintNativeEvent)\n    void OnDeath();\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
         )
         .unwrap();
 
@@ -1331,6 +1399,7 @@ mod tests {
             None,
             "class UMyAbility\n{\npublic:\n    UFUNCTION(Server, Reliable, WithValidation)\n    void ServerFire(int32 Count);\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
         )
         .unwrap();
 

@@ -416,6 +416,12 @@ pub struct ConfigCache {
 /// Query requests sent from Neovim/Lua to Rust server.
 /// Neovim/Lua 发给 Rust server 的查询请求。
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenBufferOverlay {
+    pub file_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind")]
 pub enum QueryRequest {
     // Derived/inheritance queries.
@@ -631,6 +637,8 @@ pub enum QueryRequest {
         content: String,
         #[serde(default)]
         file_path: Option<String>,
+        #[serde(default)]
+        open_files: Vec<OpenBufferOverlay>,
     },
     ParseBuildDiagnostics {
         output: String,

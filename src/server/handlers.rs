@@ -481,7 +481,11 @@ fn handle_state_query(
             Ok(Some(value))
         }
 
-        QueryRequest::GetDiagnostics { content, file_path } => {
+        QueryRequest::GetDiagnostics {
+            content,
+            file_path,
+            open_files,
+        } => {
             let engine_conn = match engine_db_path
                 .as_deref()
                 .map(normalize_to_native)
@@ -502,6 +506,7 @@ fn handle_state_query(
                 engine_conn.as_ref(),
                 &content,
                 file_path,
+                &open_files,
             )?;
             Ok(Some(value))
         }
