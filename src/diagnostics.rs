@@ -255,7 +255,7 @@ fn incomplete_member_declaration_item(
     content: &str,
     file_path: &str,
 ) -> Option<DiagnosticItem> {
-    if node.kind() != "field_declaration" {
+    if !matches!(node.kind(), "field_declaration" | "ERROR") {
         return None;
     }
 
@@ -273,20 +273,31 @@ fn incomplete_member_declaration_item(
         return None;
     };
 
-    let Some(declarator) = find_child_by_field(node, "declarator") else {
-        return None;
-    };
-    let Some(name_node) = find_name_node(declarator) else {
-        return None;
-    };
-
-    let start = declaration_start(node, declarator);
-    let end = name_node.end_position();
-    let name = node_text(name_node, content).trim().to_string();
+    let declarator = find_child_by_field(node, "declarator");
+    let name_node = declarator
+        .and_then(find_name_node)
+        .or_else(|| find_name_node(node));
+    let name = name_node
+        .map(|name_node| node_text(name_node, content).trim().to_string())
+        .or_else(|| {
+            let regex = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(").ok()?;
+            regex
+                .captures_iter(&text)
+                .last()
+                .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+        })
+        .unwrap_or_default();
 
     if name.is_empty() {
         return None;
     }
+
+    let start = declarator
+        .map(|declarator| declaration_start(node, declarator))
+        .unwrap_or_else(|| node.start_position());
+    let end = name_node
+        .map(|name_node| name_node.end_position())
+        .unwrap_or_else(|| node.end_position());
 
     Some(
         DiagnosticItem::new(
