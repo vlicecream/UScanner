@@ -4051,7 +4051,9 @@ fn enclosing_class(node: Node, content: &str) -> Option<String> {
             "class_specifier"
             | "struct_specifier"
             | "unreal_class_declaration"
-            | "unreal_struct_declaration" => {
+            | "unreal_struct_declaration"
+            | "unreal_reflected_class_declaration"
+            | "unreal_reflected_struct_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     return Some(clean_type(node_text(name, content)));
                 }
@@ -5472,5 +5474,49 @@ public:
         );
 
         assert!(has_label(&items, "HeaderOnlyAction"));
+    }
+
+    #[test]
+    fn reflected_class_scope_completion_surfaces_engine_parent_members() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let file_id: i64 = project_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let child_id = insert_class(&project_conn, "UMyAbility", file_id);
+        insert_external_inheritance(&project_conn, child_id, "UGameplayAbility");
+
+        let gameplay_ability_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member(
+            &engine_conn,
+            gameplay_ability_id,
+            "CancelAllAbilities",
+            "function",
+            Some("void"),
+            "protected",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+UCLASS()
+class UMyAbility : public UGameplayAbility
+{
+    GENERATED_BODY()
+
+public:
+    Canc/*cursor*/
+};
+"#,
+        );
+
+        assert!(has_label(&items, "CancelAllAbilities"));
     }
 }
