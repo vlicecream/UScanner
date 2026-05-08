@@ -1603,13 +1603,14 @@ fn collect_buffer_symbols_recursive(
             | "unreal_reflected_struct_declaration"
             | "unreal_reflected_enum_declaration" => {
                 append_buffer_type_item(child, content, prefix, seen, items);
+                collect_buffer_symbols_recursive(child, content, cursor_row, seen, items, prefix);
             }
 
             "function_definition" => {
                 append_buffer_function_item(child, content, prefix, seen, items);
             }
 
-            "declaration" => {
+            "declaration" | "field_declaration" | "unreal_function_declaration" => {
                 append_buffer_function_item(child, content, prefix, seen, items);
             }
 
@@ -1617,7 +1618,9 @@ fn collect_buffer_symbols_recursive(
                 collect_buffer_symbols_recursive(child, content, cursor_row, seen, items, prefix);
             }
 
-            _ => {}
+            _ => {
+                collect_buffer_symbols_recursive(child, content, cursor_row, seen, items, prefix);
+            }
         }
     }
 }
@@ -1667,10 +1670,6 @@ fn append_buffer_function_item(
     seen: &mut HashSet<String>,
     items: &mut Vec<Value>,
 ) {
-    if is_inside_class_like(node) {
-        return;
-    }
-
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };
@@ -1808,26 +1807,6 @@ fn enclosing_callable(node: Node) -> Option<Node> {
     }
 
     None
-}
-
-fn is_inside_class_like(node: Node) -> bool {
-    let mut current = node.parent();
-
-    while let Some(node) = current {
-        if matches!(
-            node.kind(),
-            "class_specifier"
-                | "struct_specifier"
-                | "unreal_reflected_class_declaration"
-                | "unreal_reflected_struct_declaration"
-        ) {
-            return true;
-        }
-
-        current = node.parent();
-    }
-
-    false
 }
 
 fn node_contains_point(node: Node, point: Point) -> bool {
@@ -5436,5 +5415,62 @@ public:
         );
 
         assert!(has_label(&member_items, "ActivateCombo"));
+    }
+
+    #[test]
+    fn class_scope_completion_surfaces_engine_parent_members() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let actor_id = insert_class(&engine_conn, "AActor", engine_file_id);
+        insert_member(
+            &engine_conn,
+            actor_id,
+            "PostInitializeComponents",
+            "function",
+            Some("void"),
+            "protected",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class AMyActor : public AActor
+{
+public:
+    PostI/*cursor*/
+};
+"#,
+        );
+
+        assert!(has_label(&items, "PostInitializeComponents"));
+    }
+
+    #[test]
+    fn class_scope_completion_surfaces_header_function_declarations() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+class AMyActor
+{
+public:
+    void HeaderOnlyAction();
+
+    void Test()
+    {
+        HeaderO/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "HeaderOnlyAction"));
     }
 }
