@@ -369,7 +369,7 @@ fn extract_macro_arguments(text: &str, macro_name: &str) -> Option<String> {
 fn is_function_or_field_node(node: Node) -> bool {
     matches!(
         node.kind(),
-        "field_declaration" | "function_definition" | "unreal_function_declaration"
+        "field_declaration" | "declaration" | "function_definition" | "unreal_function_declaration"
     )
 }
 
