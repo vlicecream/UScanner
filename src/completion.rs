@@ -325,7 +325,7 @@ pub fn process_completion_with_engine(
     let mut class_member_count = 0usize;
     if !prefix.is_empty() {
         if let Some(current_class) = current_class.as_deref() {
-            let members = fetch_members_with_engine(
+            let mut members = fetch_members_with_engine(
                 &mut ctx,
                 engine_ctx.as_mut(),
                 current_class,
@@ -337,6 +337,15 @@ pub fn process_completion_with_engine(
                 false,
                 declaration_context,
             )?;
+            if declaration_context {
+                apply_declaration_completion_edits(
+                    &mut members,
+                    content,
+                    line,
+                    character,
+                    &prefix,
+                );
+            }
             class_member_count = members.len();
 
             merge_completion_items(&mut items, members, MAX_COMPLETION_ITEMS);
@@ -700,6 +709,128 @@ fn text_prefix_at(content: &str, line: usize, character: usize) -> Option<String
     }
 
     Some(prefix.to_string())
+}
+
+fn apply_declaration_completion_edits(
+    items: &mut [Value],
+    content: &str,
+    line: u32,
+    character: u32,
+    prefix: &str,
+) {
+    if prefix.is_empty() {
+        return;
+    }
+
+    for item in items.iter_mut() {
+        if item.get("kind").and_then(Value::as_i64) != Some(2) {
+            continue;
+        }
+
+        let Some(label) = item.get("label").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(insert_text) = item.get("insertText").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let start = declaration_completion_start(content, line as usize, character as usize, prefix, label, insert_text);
+        item["textEdit"] = json!({
+            "newText": insert_text,
+            "range": {
+                "start": {
+                    "line": line,
+                    "character": start as u32,
+                },
+                "end": {
+                    "line": line,
+                    "character": character,
+                },
+            },
+        });
+    }
+}
+
+fn declaration_completion_start(
+    content: &str,
+    line: usize,
+    character: usize,
+    prefix: &str,
+    label: &str,
+    insert_text: &str,
+) -> usize {
+    let Some(line_text) = content.lines().nth(line) else {
+        return character.saturating_sub(prefix.len());
+    };
+
+    let mut end = character.min(line_text.len());
+    while end > 0 && !line_text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let before = &line_text[..end];
+    let prefix_start = end.saturating_sub(prefix.len());
+    let mut start = prefix_start;
+    let before_prefix = &before[..prefix_start.min(before.len())];
+
+    if let Some(head) = insert_text.split(label).next() {
+        let trimmed_head = head.trim_end();
+        if !trimmed_head.is_empty() {
+            if let Some(pos) = before_prefix.rfind(trimmed_head) {
+                start = pos;
+            } else {
+                if let Some(stripped) = trimmed_head.strip_prefix("virtual ") {
+                    let stripped = stripped.trim_end();
+                    if !stripped.is_empty() {
+                        if let Some(pos) = before_prefix.rfind(stripped) {
+                            start = pos;
+                        }
+                    }
+                }
+
+                if trimmed_head.starts_with("virtual ") {
+                    if let Some(pos) = rfind_word(before_prefix, "virtual") {
+                        start = start.min(pos);
+                    }
+                }
+            }
+        }
+    }
+
+    start
+}
+
+fn rfind_word(text: &str, needle: &str) -> Option<usize> {
+    let mut search_from = text.len();
+
+    while search_from >= needle.len() {
+        let haystack = &text[..search_from];
+        let pos = haystack.rfind(needle)?;
+        let end = pos + needle.len();
+        let before_ok = pos == 0
+            || !text[..pos]
+                .chars()
+                .next_back()
+                .map(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                .unwrap_or(false);
+        let after_ok = end >= text.len()
+            || !text[end..]
+                .chars()
+                .next()
+                .map(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                .unwrap_or(false);
+
+        if before_ok && after_ok {
+            return Some(pos);
+        }
+
+        if pos == 0 {
+            break;
+        }
+        search_from = pos;
+    }
+
+    None
 }
 
 /// Previous non-comment sibling.
@@ -5882,6 +6013,76 @@ public:
             item.get("insertText").and_then(Value::as_str),
             Some("virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;"),
         );
+    }
+
+    #[test]
+    fn class_scope_function_completion_replaces_existing_virtual_return_prefix() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let file_id: i64 = project_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let child_id = insert_class(&project_conn, "UMyHero", file_id);
+        insert_external_inheritance(&project_conn, child_id, "UGameplayAbility");
+
+        let parent_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member_with_detail(
+            &engine_conn,
+            parent_id,
+            "GetAbilitySystemComponent",
+            "function",
+            Some("UAbilitySystemComponent*"),
+            Some("() const"),
+            "protected",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UMyHero : public UGameplayAbility
+{
+public:
+    virtual UAbilitySystemComponent* GetAbility/*cursor*/
+};
+"#,
+        );
+
+        let item = item_by_label(&items, "GetAbilitySystemComponent").unwrap();
+        let text_edit = item.get("textEdit").unwrap();
+        assert_eq!(
+            text_edit.get("newText").and_then(Value::as_str),
+            Some("virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;"),
+        );
+        assert_eq!(
+            text_edit
+                .get("range")
+                .and_then(|range| range.get("start"))
+                .and_then(|start| start.get("character"))
+                .and_then(Value::as_u64),
+            Some(4),
+        );
+    }
+
+    #[test]
+    fn declaration_completion_start_prefers_return_type_prefix() {
+        let source = r#"    UAbilitySystemComponent* GetAbility"#;
+        let start = declaration_completion_start(
+            source,
+            0,
+            source.len(),
+            "GetAbility",
+            "GetAbilitySystemComponent",
+            "virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;",
+        );
+
+        assert_eq!(start, 4);
     }
 
     #[test]
