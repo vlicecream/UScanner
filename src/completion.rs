@@ -292,6 +292,7 @@ pub fn process_completion_with_engine(
                 persistent_cache,
                 current_class.as_deref(),
                 false,
+                false,
             )?;
 
             let final_items = dedupe_completion_items(members);
@@ -302,6 +303,11 @@ pub fn process_completion_with_engine(
         return Ok(json!([]));
     }
 
+    let current_class = enclosing_class(cursor_node, content);
+    let declaration_context = current_class.is_some()
+        && byte_offset_at(content, line as usize, character as usize)
+            .map(|offset| is_member_declaration_context_text(&content[..offset]))
+            .unwrap_or(false);
     let prefix = text_prefix_at(content, line as usize, character as usize)
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| completion_prefix(cursor_node, content));
@@ -316,7 +322,6 @@ pub fn process_completion_with_engine(
     let buffer_items = collect_buffer_symbol_items(root, content, line as usize, &prefix);
     merge_completion_items(&mut items, buffer_items, MAX_COMPLETION_ITEMS);
 
-    let current_class = enclosing_class(cursor_node, content);
     let mut class_member_count = 0usize;
     if !prefix.is_empty() {
         if let Some(current_class) = current_class.as_deref() {
@@ -330,6 +335,7 @@ pub fn process_completion_with_engine(
                 persistent_cache.clone(),
                 Some(current_class),
                 false,
+                declaration_context,
             )?;
             class_member_count = members.len();
 
@@ -402,6 +408,7 @@ fn fetch_super_members_with_engine(
         persistent_cache,
         Some(current_class),
         true,
+        false,
     )
 }
 
@@ -417,6 +424,7 @@ fn fetch_members_with_engine(
     persistent_cache: Option<Arc<Mutex<Connection>>>,
     accessor_class: Option<&str>,
     assume_engine_subclass_access: bool,
+    declaration_context: bool,
 ) -> Result<Vec<Value>> {
     let mut items = fetch_members_recursive(
         ctx,
@@ -427,6 +435,7 @@ fn fetch_members_with_engine(
         accessor_class,
         false,
         false,
+        declaration_context,
     )?;
 
     for parent_name in direct_buffer_parents(buffer_inheritance, class_name) {
@@ -439,6 +448,7 @@ fn fetch_members_with_engine(
             accessor_class,
             true,
             false,
+            declaration_context,
         )?;
 
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
@@ -470,6 +480,7 @@ fn fetch_members_with_engine(
             accessor_class,
             assume_subclass_access,
             true,
+            declaration_context,
         )?;
 
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
@@ -1809,6 +1820,44 @@ fn enclosing_callable(node: Node) -> Option<Node> {
     None
 }
 
+fn is_member_declaration_context_text(before_cursor: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BlockKind {
+        TypeLike,
+        Other,
+    }
+
+    let mut stack = Vec::new();
+
+    for (index, ch) in before_cursor.char_indices() {
+        match ch {
+            '{' => {
+                let header_start = before_cursor[..index]
+                    .rfind(|ch| matches!(ch, ';' | '{' | '}'))
+                    .map(|found| found + 1)
+                    .unwrap_or(0);
+                let header = before_cursor[header_start..index].trim();
+                let is_type_like = header.contains("class ")
+                    || header.contains("struct ")
+                    || header.contains("enum ")
+                    || header.starts_with("namespace")
+                    || header.contains(" namespace ");
+                stack.push(if is_type_like {
+                    BlockKind::TypeLike
+                } else {
+                    BlockKind::Other
+                });
+            }
+            '}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    matches!(stack.last(), Some(BlockKind::TypeLike))
+}
+
 fn node_contains_point(node: Node, point: Point) -> bool {
     !point_is_before(point, node.start_position()) && !point_is_before(node.end_position(), point)
 }
@@ -2099,17 +2148,19 @@ fn fetch_members_recursive(
     accessor_class: Option<&str>,
     assume_subclass_access: bool,
     include_impl_members: bool,
+    declaration_context: bool,
 ) -> Result<Vec<Value>> {
     let class_name = resolve_typedef(ctx, class_name)?;
     let prefix = prefix.unwrap_or_default();
     let accessor = accessor_class.unwrap_or("");
     let cache_key = format!(
-        "completion:{}:{}:{}:{}:{}",
+        "completion:{}:{}:{}:{}:{}:{}",
         class_name,
         prefix,
         accessor,
         assume_subclass_access as u8,
         include_impl_members as u8,
+        declaration_context as u8,
     );
 
     if let Some(items) = read_completion_cache(&cache_key, &memory_cache, &persistent_cache)? {
@@ -2152,6 +2203,7 @@ fn fetch_members_recursive(
             accessor,
             assume_subclass_access,
             include_impl_members,
+            declaration_context,
             &mut seen_items,
             &mut items,
         )?;
@@ -2200,6 +2252,7 @@ fn append_members_for_class(
     accessor_class: &str,
     assume_subclass_access: bool,
     include_impl_members: bool,
+    declaration_context: bool,
     seen: &mut HashSet<String>,
     items: &mut Vec<Value>,
 ) -> Result<()> {
@@ -2260,8 +2313,24 @@ fn append_members_for_class(
             continue;
         }
 
+        let signature_info = if member_type == "function" {
+            resolve_function_signature_info(
+                detail.as_deref(),
+                file_path.as_deref(),
+                line,
+                &name,
+                &mut ctx.file_cache,
+            )
+        } else {
+            None
+        };
+        let function_detail = signature_info
+            .as_ref()
+            .map(|info| info.detail.as_str())
+            .or(detail.as_deref());
+
         let detail_text = if member_type == "function" {
-            function_completion_detail(return_type.as_deref(), detail.as_deref(), Some(owner_class))
+            function_completion_detail(return_type.as_deref(), function_detail, Some(owner_class))
         } else {
             member_detail(return_type.as_deref(), owner_class)
         };
@@ -2276,15 +2345,38 @@ fn append_members_for_class(
             .and_then(|path| line.map(|line| extract_comment_from_file(path, line, &mut ctx.file_cache)))
             .unwrap_or_default();
 
-        let documentation = merge_docs(documentation, detail.clone());
+        let documentation = merge_docs(
+            documentation,
+            function_detail
+                .map(|text| text.to_string())
+                .or(detail.clone()),
+        );
         let kind = completion_kind(&member_type);
         let sort_text = completion_sort_text(class_rank * 1000 + match_rank, kind, &name);
         let insert_text = if member_type == "function" {
-            function_snippet_text(&name, detail.as_deref())
+            if declaration_context {
+                let should_override = owner_class != accessor_class
+                    && signature_info
+                        .as_ref()
+                        .map(|info| !info.is_static)
+                        .unwrap_or(true);
+                function_declaration_insert_text(
+                    return_type.as_deref(),
+                    &name,
+                    function_detail,
+                    should_override,
+                )
+            } else {
+                function_snippet_text(&name, function_detail)
+            }
         } else {
             name.clone()
         };
-        let insert_text_format = if member_type == "function" { 2 } else { 1 };
+        let insert_text_format = if member_type == "function" && !declaration_context {
+            2
+        } else {
+            1
+        };
 
         matched.push(json!({
             "label": name,
@@ -3664,12 +3756,91 @@ fn function_completion_detail(
 }
 
 fn function_snippet_text(name: &str, params: Option<&str>) -> String {
-    let placeholders = function_param_placeholders(params.unwrap_or("()"));
+    let placeholders = function_param_placeholders(function_parameter_list(params.unwrap_or("()")));
     if placeholders.is_empty() {
         return format!("{}($1)", name);
     }
 
     format!("{}({})", name, placeholders.join(", "))
+}
+
+fn function_declaration_insert_text(
+    return_type: Option<&str>,
+    name: &str,
+    detail: Option<&str>,
+    add_override: bool,
+) -> String {
+    let return_type = return_type
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty());
+    let params = function_parameter_list(detail.unwrap_or("()"));
+    let suffix = normalize_override_suffix(function_signature_suffix(detail.unwrap_or("()")));
+
+    let mut text = String::new();
+    if add_override {
+        text.push_str("virtual ");
+    }
+    if let Some(return_type) = return_type {
+        text.push_str(return_type);
+        text.push(' ');
+    }
+    text.push_str(name);
+    text.push_str(params);
+
+    if !suffix.is_empty() {
+        text.push(' ');
+        text.push_str(&suffix);
+    }
+    if add_override {
+        text.push_str(" override");
+    }
+    text.push(';');
+    text
+}
+
+fn function_parameter_list(detail: &str) -> &str {
+    function_signature_span(detail)
+        .map(|(start, end)| &detail[start..=end])
+        .unwrap_or("()")
+}
+
+fn function_signature_suffix(detail: &str) -> &str {
+    function_signature_span(detail)
+        .map(|(_, end)| detail[end + 1..].trim())
+        .unwrap_or("")
+}
+
+fn function_signature_span(text: &str) -> Option<(usize, usize)> {
+    let start = text.find('(')?;
+    let mut depth = 0usize;
+
+    for (offset, ch) in text[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((start, start + offset));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn normalize_override_suffix(suffix: &str) -> String {
+    let suffix = suffix
+        .split_once('=')
+        .map(|(head, _)| head.trim())
+        .unwrap_or_else(|| suffix.trim());
+
+    suffix
+        .split_whitespace()
+        .filter(|token| *token != "override" && *token != "final")
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn function_param_placeholders(params: &str) -> Vec<String> {
@@ -3843,18 +4014,7 @@ fn extract_comment_from_file(
         return String::new();
     }
 
-    if !file_cache.contains_key(file_path) {
-        let Ok(content) = std::fs::read_to_string(file_path) else {
-            return String::new();
-        };
-
-        file_cache.insert(
-            file_path.to_string(),
-            content.lines().map(|line| line.to_string()).collect(),
-        );
-    }
-
-    let Some(lines) = file_cache.get(file_path) else {
+    let Some(lines) = cached_file_lines(file_path, file_cache) else {
         return String::new();
     };
 
@@ -3913,6 +4073,132 @@ fn extract_comment_from_file(
 
     comments.reverse();
     comments.into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
+#[derive(Clone, Debug)]
+struct FunctionSignatureInfo {
+    detail: String,
+    is_static: bool,
+}
+
+fn resolve_function_signature_info(
+    db_detail: Option<&str>,
+    file_path: Option<&str>,
+    line_number: Option<usize>,
+    name: &str,
+    file_cache: &mut HashMap<String, Vec<String>>,
+) -> Option<FunctionSignatureInfo> {
+    if let (Some(file_path), Some(line_number)) = (file_path, line_number) {
+        if let Some(info) =
+            extract_function_signature_from_file(file_path, line_number, name, file_cache)
+        {
+            return Some(info);
+        }
+    }
+
+    db_detail
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|detail| FunctionSignatureInfo {
+            detail: detail.to_string(),
+            is_static: false,
+        })
+}
+
+fn extract_function_signature_from_file(
+    file_path: &str,
+    line_number: usize,
+    name: &str,
+    file_cache: &mut HashMap<String, Vec<String>>,
+) -> Option<FunctionSignatureInfo> {
+    if line_number == 0 {
+        return None;
+    }
+
+    let lines = cached_file_lines(file_path, file_cache)?;
+    let start = line_number.saturating_sub(1).min(lines.len().saturating_sub(1));
+    let mut text = String::new();
+    let mut depth = 0usize;
+    let mut saw_open = false;
+
+    for line in lines.iter().skip(start).take(8) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() && text.is_empty() {
+            continue;
+        }
+
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(trimmed);
+
+        for ch in trimmed.chars() {
+            match ch {
+                '(' => {
+                    saw_open = true;
+                    depth += 1;
+                }
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+
+        if saw_open && depth == 0 && (trimmed.contains(';') || trimmed.contains('{')) {
+            break;
+        }
+    }
+
+    let detail = function_detail_from_signature_text(&text, name)?;
+    let is_static = function_prefix_from_signature_text(&text, name)
+        .split_whitespace()
+        .any(|token| token == "static");
+
+    Some(FunctionSignatureInfo { detail, is_static })
+}
+
+fn function_detail_from_signature_text(signature: &str, name: &str) -> Option<String> {
+    let prefix = function_prefix_from_signature_text(signature, name);
+    let start = prefix.len() + name.len();
+    if start > signature.len() {
+        return None;
+    }
+    let tail = &signature[start..];
+    let params = function_parameter_list(tail);
+    let suffix = function_signature_suffix(tail)
+        .split(['{', ';'])
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    let mut detail = params.to_string();
+    if !suffix.is_empty() {
+        detail.push(' ');
+        detail.push_str(suffix);
+    }
+
+    Some(detail)
+}
+
+fn function_prefix_from_signature_text<'a>(signature: &'a str, name: &str) -> &'a str {
+    signature
+        .find(name)
+        .map(|index| &signature[..index])
+        .unwrap_or("")
+}
+
+fn cached_file_lines<'a>(
+    file_path: &str,
+    file_cache: &'a mut HashMap<String, Vec<String>>,
+) -> Option<&'a Vec<String>> {
+    if !file_cache.contains_key(file_path) {
+        let content = std::fs::read_to_string(file_path).ok()?;
+        file_cache.insert(
+            file_path.to_string(),
+            content.lines().map(|line| line.to_string()).collect(),
+        );
+    }
+
+    file_cache.get(file_path)
 }
 
 /// Merge comment documentation and DB detail.
@@ -4488,6 +4774,37 @@ mod tests {
              (class_id, name_id, type_id, access, return_type_id, line_number, file_id)
              VALUES (?, ?, ?, ?, ?, 1, ?)",
             rusqlite::params![class_id, name_id, type_id, access, return_type_id, file_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_member_with_detail(
+        conn: &Connection,
+        class_id: i64,
+        name: &str,
+        member_type: &str,
+        return_type: Option<&str>,
+        detail: Option<&str>,
+        access: &str,
+        file_id: i64,
+    ) {
+        let name_id = insert_string(conn, name);
+        let type_id = insert_string(conn, member_type);
+        let return_type_id = return_type.map(|text| insert_string(conn, text));
+
+        conn.execute(
+            "INSERT INTO members
+             (class_id, name_id, type_id, access, return_type_id, detail, line_number, file_id)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            rusqlite::params![
+                class_id,
+                name_id,
+                type_id,
+                access,
+                return_type_id,
+                detail,
+                file_id
+            ],
         )
         .unwrap();
     }
@@ -5518,5 +5835,65 @@ public:
         );
 
         assert!(has_label(&items, "CancelAllAbilities"));
+    }
+
+    #[test]
+    fn class_scope_function_completion_inserts_override_declaration() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let file_id: i64 = project_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let child_id = insert_class(&project_conn, "UMyHero", file_id);
+        insert_external_inheritance(&project_conn, child_id, "UGameplayAbility");
+
+        let parent_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member_with_detail(
+            &engine_conn,
+            parent_id,
+            "GetAbilitySystemComponent",
+            "function",
+            Some("UAbilitySystemComponent*"),
+            Some("() const"),
+            "protected",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UMyHero : public UGameplayAbility
+{
+public:
+    GetAbility/*cursor*/
+};
+"#,
+        );
+
+        let item = item_by_label(&items, "GetAbilitySystemComponent").unwrap();
+        assert_eq!(item.get("insertTextFormat").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            item.get("insertText").and_then(Value::as_str),
+            Some("virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;"),
+        );
+    }
+
+    #[test]
+    fn function_declaration_insert_text_preserves_const_suffix() {
+        assert_eq!(
+            function_declaration_insert_text(
+                Some("UAbilitySystemComponent*"),
+                "GetAbilitySystemComponent",
+                Some("() const"),
+                true,
+            ),
+            "virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;",
+        );
     }
 }
